@@ -16,7 +16,7 @@ browser:
   scrolls_per_keyword: 14
   scroll_pause_seconds: 1.35
   request_delay_seconds: 0.7
-  max_candidates_per_platform: 1400
+  max_candidates_per_platform: 3000
   max_detail_visits_per_platform: 360
   detail_wait_seconds: 1.8
 
