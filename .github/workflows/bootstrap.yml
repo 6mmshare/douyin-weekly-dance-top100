@@ -23,7 +23,7 @@ jobs:
           set -euo pipefail
           cat bootstrap/chunk-*.txt > /tmp/source.b64
           base64 --decode /tmp/source.b64 > /tmp/source.zip
-          printf '%s  %s\n' 'd6cfee037352923eda1fbc668597966bf4b8fd9c80f487dfa9f45ab488f18876' '/tmp/source.zip' | sha256sum --check
+          printf '%s  %s\n' 'ffddcbc38cd75e418fea58197cf5b916db3d5e77ac52b435059bda96971b81d6' '/tmp/source.zip' | sha256sum --check
           rm -rf /tmp/source
           mkdir -p /tmp/source
           unzip -q /tmp/source.zip -d /tmp/source
