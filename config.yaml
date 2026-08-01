@@ -1,0 +1,228 @@
+# 抖音每周舞蹈候选 Top100（断点续跑与访问节奏保护版）
+# 默认统计运行日前的 7 个完整自然日，不包含运行当天。
+timezone: Asia/Shanghai
+window_mode: previous_7_complete_days
+top_n_per_platform: 100
+output_root: output
+
+browser:
+  # run_weekly.bat 使用 --background：正常浏览器移到屏幕外，避免抖音真无头模式返回空结果。
+  # 这里保留 true 仅供未指定运行模式时使用。
+  headless: true
+  background_window_x: -32000
+  background_window_y: -32000
+  slow_mo_ms: 0
+  navigation_timeout_ms: 60000
+  scrolls_per_keyword: 14
+  scroll_pause_seconds: 1.35
+  request_delay_seconds: 0.7
+  max_candidates_per_platform: 1400
+  max_detail_visits_per_platform: 360
+  detail_wait_seconds: 1.8
+
+  # 断点续跑与访问节奏。每20条原子落盘；异常、验证码、Ctrl+C时也会最后保存。
+  checkpoint_batch_size: 20
+  detail_delay_min_seconds: 2.2
+  detail_delay_max_seconds: 4.8
+  batch_rest_min_seconds: 18
+  batch_rest_max_seconds: 40
+  max_detail_attempts: 2
+  failure_backoff_base_seconds: 3
+  failure_backoff_max_seconds: 45
+  consecutive_failure_cooldown_after: 4
+  consecutive_failure_abort_after: 8
+  cooldown_min_seconds: 45
+  cooldown_max_seconds: 90
+  lock_stale_hours: 12
+
+  save_debug_screenshots: true
+  headless_abort_after_empty_keywords: 4
+  headless_min_candidates_before_empty_abort: 8
+  # 同一批结果被多个关键词重复返回时，判定搜索没有真正切换并自动重试。
+  repeated_result_jaccard_threshold: 0.88
+  minimum_keyword_result_count: 5
+
+filters:
+  # 只做宽松文字筛选，最终由大封面页面人工删减到 Top50。
+  # 搜索词不再给候选大量加分，避免任何无关视频因为来源词而被误判。
+  minimum_target_match: 8
+  minimum_dance_relevance: 12
+  exclude_minor_text_signals: true
+
+  minor_terms:
+    - 未成年
+    - 小学生
+    - 初中生
+    - 高中生
+    - 幼儿园
+    - 儿童
+    - 少儿
+    - 萌娃
+    - 校服妹妹
+    - kid
+    - kids
+    - child
+    - schoolgirl
+    - underage
+
+  female_text_terms:
+    - 小姐姐
+    - 美女
+    - 辣妹
+    - 御姐
+    - 女神
+    - 姐姐
+    - 女生
+    - 女性
+    - girl
+    - woman
+    - female
+    - beauty
+    - queen
+
+  solo_terms:
+    - 单人
+    - 独舞
+    - solo
+    - 一个人跳
+    - 个人舞
+    - 对镜
+    - 自拍
+    - 全身舞
+    - 一镜到底
+
+  sexy_style_terms:
+    - 性感
+    - 热辣
+    - 辣妹
+    - 纯欲
+    - 妩媚
+    - 撩人
+    - 御姐
+    - 甜辣
+    - 氛围感
+    - 高级感
+    - 扭腰
+    - 扭胯
+    - 摆胯
+    - 摇胯
+    - 腰胯
+    - 身材
+    - 高跟鞋
+    - 椅子舞
+    - 慢摇
+    - sexy
+    - hot dance
+    - heels
+    - body wave
+    - waacking
+    - girl crush
+
+  male_terms:
+    - 男生跳舞
+    - 男舞者
+    - 男团
+    - 小哥哥跳舞
+    - 正太
+    - 男孩跳舞
+    - 哥哥舞蹈
+    - 猛男舞
+
+  group_terms:
+    - 群舞
+    - 多人舞
+    - 双人舞
+    - 三人舞
+    - 团舞
+    - 团播
+    - 女团
+    - 群像
+    - 姐妹合跳
+    - 情侣舞
+    - 兄妹舞
+    - 合跳
+    - 齐舞
+    - 组合舞
+    - 多人版
+
+  format_exclude_terms:
+    - 舞蹈教程
+    - 教学
+    - 分解教学
+    - 慢动作教学
+    - 镜面教学
+    - 跟练
+    - 动作分解
+    - 教程版
+    - 合集
+    - 盘点
+    - 混剪
+    - 影视剪辑
+    - 综艺片段
+    - reaction
+    - 二创
+    - 搬运
+    - 直播录屏
+
+  non_human_terms:
+    - AI舞蹈
+    - AI美女
+    - 动漫
+    - 动画
+    - 游戏角色
+    - 虚拟人
+    - 数字人
+    - 换脸
+
+# 先筛内容，再在合格候选中按热度排序。
+scoring:
+  likes: 0.25
+  shares: 0.20
+  favorites: 0.15
+  comments: 0.10
+  likes_velocity: 0.20
+  target_match: 0.10
+
+platforms:
+  douyin:
+    enabled: true
+    locale: zh-CN
+    # 默认搜索词可按需要修改；已排除与硬过滤规则冲突的搜索词。
+    keywords:
+      - 辣妹舞蹈 单人
+      - 性感舞蹈 单人女生
+      - 性感纯欲舞 单人
+      - 舞蹈性感穿搭 单人热舞
+      - 妩媚性感 舞蹈
+      - 纯欲天花板 跳舞
+      - 美女热舞 单人
+      - 纯御舞 单人
+      - 浅跳一下 美女舞蹈
+      - 扭胯舞 女生单人
+      - 辣妹跳舞
+      - 小姐姐热舞
+      - 御姐热舞
+      - 扭胯舞
+      - 摇胯舞
+      - 摆胯舞
+      - 扭腰舞
+      - 慢摇舞
+      - 高跟鞋舞
+      - 椅子舞
+      - 对镜跳舞
+      - 全身舞蹈女生
+      - 一镜到底舞蹈
+      - 韩舞翻跳女生
+      - urban舞蹈女生
+      - waacking女生
+      - girl crush舞蹈
+      - sexy dance女生
+      - 舞蹈生热舞
+  kuaishou:
+    enabled: false
+    locale: zh-CN
+    keywords: []
+  tiktok:
+    enabled: false
+    locale: en-US
+    keywords: []

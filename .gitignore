@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Private browser state and runtime data
+# These directories may contain login cookies, local storage, account state,
+# captured public metadata, checkpoints, logs, screenshots, and generated reports.
+data/profiles/
+data/checkpoints/
+data/locks/
+output/
+logs/
+debug_screenshots/
+
+# Local overrides and editor files
+config.local.yaml
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
