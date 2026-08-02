@@ -1,0 +1,57 @@
+name: Sync strict weekly window files
+
+on:
+  push:
+    paths:
+      - "bootstrap/strict-week-sync-20260802/ready.txt"
+
+permissions:
+  contents: write
+
+jobs:
+  sync-files:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct and validate package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat bootstrap/strict-week-sync-20260802/chunk-*.txt > /tmp/strict-week.b64
+          base64 --decode /tmp/strict-week.b64 > /tmp/strict-week.zip
+          printf '%s  %s\n' '0c37be7978690c9060d459442ebe6d3ea497660de48d43de69e303a7e445f8e2' '/tmp/strict-week.zip' | sha256sum --check
+          unzip -oq /tmp/strict-week.zip -d .
+          python -m py_compile weekly_dance_ranker.py
+          python - <<'PY'
+          from pathlib import Path
+          source = Path('weekly_dance_ranker.py').read_text(encoding='utf-8')
+          config = Path('config.yaml').read_text(encoding='utf-8')
+          assert 'CHECKPOINT_VERSION = 5' in source
+          assert 'require_known_publish_time: true' in config
+          assert '跳过窗口外视频' in source
+          assert '发布时间缺失跳过' in source
+          PY
+
+      - name: Remove temporary bootstrap files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bootstrap/strict-week-sync-20260802
+          rm -f .github/workflows/sync-strict-week-20260802.yml
+          rmdir bootstrap 2>/dev/null || true
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+
+      - name: Commit exact files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Enforce strict weekly publish-time filtering"
+          git push
