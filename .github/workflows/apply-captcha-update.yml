@@ -1,9 +1,9 @@
-name: Apply CAPTCHA monitoring update
+name: Apply CAPTCHA false-positive fix
 
 on:
   push:
     paths:
-      - "bootstrap/captcha-ready.txt"
+      - "bootstrap/captcha-v2-ready.txt"
 
 permissions:
   contents: write
@@ -17,18 +17,31 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Reconstruct update package
+      - name: Reconstruct and apply patch
         shell: bash
         run: |
           set -euo pipefail
-          cat bootstrap/captcha-chunk-*.txt > /tmp/captcha-update.b64
-          base64 --decode /tmp/captcha-update.b64 > /tmp/captcha-update.zip
-          printf '%s  %s\n' '3a625eec68e3cbf4f2df790750695e69d9f33ce209a49aa91053609846b4a8ea' '/tmp/captcha-update.zip' | sha256sum --check
-          unzip -oq /tmp/captcha-update.zip -d .
+          cat bootstrap/captcha-v2-chunk-*.txt > /tmp/captcha-v2.b64
+          base64 --decode /tmp/captcha-v2.b64 > /tmp/captcha-v2.patch
+          printf '%s  %s\n' '3108d4d379ddcffa623c76808c10280af11236eb28ed8af6dca2fe31039ad6b4' '/tmp/captcha-v2.patch' | sha256sum --check
+          git apply --check /tmp/captcha-v2.patch
+          git apply /tmp/captcha-v2.patch
           rm -rf bootstrap
           rm -f .github/workflows/apply-captcha-update.yml
           rmdir .github/workflows 2>/dev/null || true
           rmdir .github 2>/dev/null || true
+
+      - name: Validate Python and YAML
+        shell: bash
+        run: |
+          python -m py_compile weekly_dance_ranker.py
+          python - <<'PY'
+          import yaml
+          with open('config.yaml', encoding='utf-8') as f:
+              data = yaml.safe_load(f)
+          assert data['browser']['verification_min_evidence_score'] == 4
+          assert data['browser']['keyword_delay_min_seconds'] == 12
+          PY
 
       - name: Commit update
         shell: bash
@@ -37,5 +50,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "Improve CAPTCHA monitoring and keyword pacing"
+          git commit -m "Fix CAPTCHA false positives and improve pacing"
           git push
