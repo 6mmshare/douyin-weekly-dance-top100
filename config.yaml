@@ -48,6 +48,8 @@ filters:
   minimum_target_match: 8
   minimum_dance_relevance: 12
   exclude_minor_text_signals: true
+  # 严格周榜：搜索结果没有明确发布时间时，不打开详情页，也不进入榜单。
+  require_known_publish_time: true
 
   minor_terms:
     - 未成年

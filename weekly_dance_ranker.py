@@ -221,7 +221,7 @@ class DateWindow:
         return f"{self.start:%Y-%m-%d %H:%M} 至 {self.end:%Y-%m-%d %H:%M}（左闭右开）"
 
 
-CHECKPOINT_VERSION = 4
+CHECKPOINT_VERSION = 5
 
 
 def video_record_from_dict(raw: Mapping[str, Any]) -> VideoRecord:
@@ -1339,14 +1339,42 @@ class BaseCollector:
                     next_keyword_index = len(keywords)
 
                 prefiltered = [record for record in relevant_store.values() if prefilter_record(record, self.config)]
+                require_known_time = bool(self.config.get("filters", {}).get("require_known_publish_time", True))
+                known_in_window: list[VideoRecord] = []
+                unknown_publish_time: list[VideoRecord] = []
+                outside_window: list[VideoRecord] = []
+                for record in prefiltered:
+                    if record.create_time is None:
+                        unknown_publish_time.append(record)
+                    elif within_window(record, self.window, self.tz):
+                        known_in_window.append(record)
+                    else:
+                        outside_window.append(record)
+
+                # 周榜严格模式：只允许搜索接口已经给出、且明确位于统计窗口内的视频进入详情队列。
+                # 这样不会为了“确认日期”而打开去年或更早的视频。
+                detail_candidates = known_in_window if require_known_time else known_in_window + unknown_publish_time
+
                 diagnostics["candidate_count"] = len(relevant_store)
                 diagnostics["prefilter_count"] = len(prefiltered)
                 diagnostics["excluded_by_text"] = len(relevant_store) - len(prefiltered)
+                diagnostics["known_in_window_before_detail"] = len(known_in_window)
+                diagnostics["unknown_publish_time_skipped"] = len(unknown_publish_time) if require_known_time else 0
+                diagnostics["outside_window_skipped"] = len(outside_window)
                 if not detail_keys:
-                    prefiltered.sort(key=lambda record: (record.likes + record.shares * 4 + record.favorites * 3 + record.comments * 2, record.target_match_score), reverse=True)
-                    detail_keys = [record.key() for record in prefiltered[:max_details]]
-                save_checkpoint("detail", note="详情队列已建立")
-                logging.info("[%s] 搜索候选 %d 条，文字初筛可补全 %d 条，排除 %d 条；本轮详情上限 %d", self.label, len(relevant_store), len(prefiltered), len(relevant_store) - len(prefiltered), len(detail_keys))
+                    detail_candidates.sort(key=lambda record: (record.likes + record.shares * 4 + record.favorites * 3 + record.comments * 2, record.target_match_score), reverse=True)
+                    detail_keys = [record.key() for record in detail_candidates[:max_details]]
+                save_checkpoint("detail", note="严格时间窗口详情队列已建立")
+                logging.info(
+                    "[%s] 搜索候选 %d 条，文字初筛 %d 条；时间窗口内 %d 条，发布时间缺失跳过 %d 条，窗口外跳过 %d 条；本轮详情 %d 条",
+                    self.label,
+                    len(relevant_store),
+                    len(prefiltered),
+                    len(known_in_window),
+                    len(unknown_publish_time) if require_known_time else 0,
+                    len(outside_window),
+                    len(detail_keys),
+                )
                 pending_keys = [key for key in detail_keys if key not in completed_detail_keys]
                 logging.info("[%s] 开始/继续详情补全：总计 %d，已完成 %d，本次待处理 %d；每 %d 条原子保存一次", self.label, len(detail_keys), len(completed_detail_keys), len(pending_keys), checkpoint_batch_size)
                 consecutive_failures = 0
@@ -1363,7 +1391,16 @@ class BaseCollector:
                             self.wait_for_verification_if_needed(f"detail_loop_{record.video_id}_before_attempt")
                             self.enrich_record(record)
                             failed_attempts[key] = attempt + 1
-                            success = bool(record.title or record.likes or record.comments or record.shares or record.favorites or record.create_time)
+                            page_has_data = bool(record.title or record.likes or record.comments or record.shares or record.favorites)
+                            if record.create_time is None:
+                                record.data_quality_notes.append("发布时间缺失，按严格周榜规则排除")
+                                success = True
+                                break
+                            if not within_window(record, self.window, self.tz):
+                                record.data_quality_notes.append("发布时间超出统计窗口，已排除")
+                                success = True
+                                break
+                            success = page_has_data
                             if success:
                                 break
                             last_error = "详情没有返回可验证字段"
