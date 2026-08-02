@@ -15,7 +15,22 @@ browser:
   navigation_timeout_ms: 60000
   scrolls_per_keyword: 14
   scroll_pause_seconds: 1.35
+  # 旧版单次请求间隔（兼容保留）。真正的搜索词间隔使用下面两个配置。
   request_delay_seconds: 0.7
+  # 每个搜索词结束到下一个搜索词开始之间随机等待，并持续检查验证码。
+  keyword_delay_min_seconds: 12
+  keyword_delay_max_seconds: 20
+
+  # 验证码持续监控：前台模式检测到后自动暂停，直到验证稳定消失。
+  verification_poll_seconds: 1.5
+  # 必须连续多次检测到可见验证弹窗才暂停，避免隐藏组件或普通文本误报。
+  verification_confirm_checks: 2
+  verification_confirm_interval_seconds: 0.8
+  verification_min_evidence_score: 4
+  verification_wait_timeout_seconds: 600
+  verification_stable_clear_seconds: 5
+  verification_post_clear_delay_seconds: 4
+
   max_candidates_per_platform: 3000
   max_detail_visits_per_platform: 360
   detail_wait_seconds: 1.8
@@ -48,7 +63,7 @@ filters:
   minimum_target_match: 8
   minimum_dance_relevance: 12
   exclude_minor_text_signals: true
-  # 严格周榜：搜索结果没有明确发布时间时，不打开详情页，也不进入榜单。
+  # 严格周榜：只有发布时间明确且处于统计窗口内的视频才会打开详情页和进入榜单。
   require_known_publish_time: true
 
   minor_terms:
@@ -169,6 +184,9 @@ filters:
     - 合拍
     - 工作室
     - 老师
+    - 拉丁
+    - 爵士
+    - 广场舞
 
   non_human_terms:
     - AI舞蹈
@@ -209,19 +227,12 @@ platforms:
       - 辣妹跳舞
       - 小姐姐热舞
       - 御姐热舞
-      - 扭胯舞
-      - 摇胯舞
-      - 摆胯舞
       - 扭腰舞
       - 慢摇舞
       - 高跟鞋舞
       - 全身舞蹈女生
-      - 一镜到底舞蹈
       - urban舞蹈女生
-      - waacking女生
-      - girl crush舞蹈
       - sexy dance女生
-      - 舞蹈生热舞
   kuaishou:
     enabled: false
     locale: zh-CN
