@@ -1,0 +1,46 @@
+name: Apply strict weekly window
+
+on:
+  push:
+    paths:
+      - "bootstrap/strict-week-ready.txt"
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply strict date-window fix
+        run: python tools/apply_strict_week_window_fix.py
+
+      - name: Validate configuration
+        run: |
+          python - <<'PY'
+          import yaml
+          from pathlib import Path
+          cfg = yaml.safe_load(Path('config.yaml').read_text(encoding='utf-8'))
+          assert cfg['filters']['require_known_publish_time'] is True
+          PY
+
+      - name: Remove temporary trigger and workflow
+        run: |
+          rm -f bootstrap/strict-week-ready.txt
+          rmdir bootstrap 2>/dev/null || true
+          rm -f .github/workflows/apply-strict-week-window.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+
+      - name: Commit strict weekly filter
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Enforce strict weekly publish-time filtering"
+          git push
