@@ -160,7 +160,6 @@ class VideoRecord:
     data_sources: set[str] = field(default_factory=set)
     data_quality_notes: list[str] = field(default_factory=list)
 
-    # 内容匹配与评分字段
     dance_relevance: float = 0.0
     target_match_score: float = 0.0
     match_level: str = ""
@@ -170,7 +169,7 @@ class VideoRecord:
     exclusion_reason: str = ""
     engagement_rate: float = 0.0
     engagement_basis: str = ""
-    velocity_per_hour: float = 0.0  # 兼容旧字段；严格版不参与评分
+    velocity_per_hour: float = 0.0
     likes_per_hour: float = 0.0
     cross_platform_score: float = 0.0
     like_percentile: float = 0.0
@@ -226,7 +225,6 @@ CHECKPOINT_VERSION = 4
 
 
 def video_record_from_dict(raw: Mapping[str, Any]) -> VideoRecord:
-    """Rebuild a VideoRecord from an atomic checkpoint JSON object."""
     allowed = {field.name for field in dataclasses.fields(VideoRecord)}
     values = {key: value for key, value in dict(raw).items() if key in allowed}
     values["create_time"] = parse_datetime(values.get("create_time"))
@@ -238,7 +236,6 @@ def video_record_from_dict(raw: Mapping[str, Any]) -> VideoRecord:
 
 
 def atomic_save_json(path: Path, payload: Any) -> None:
-    """Write JSON atomically so a power loss cannot leave a half-written checkpoint."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
@@ -249,7 +246,6 @@ def atomic_save_json(path: Path, payload: Any) -> None:
 
 
 def collection_fingerprint(platform: str, config: Mapping[str, Any], platform_config: Mapping[str, Any]) -> str:
-    """Invalidate a checkpoint when keywords, filters or ranking settings change."""
     browser = config.get("browser", {})
     relevant = {
         "checkpoint_version": CHECKPOINT_VERSION,
@@ -268,14 +264,7 @@ def collection_fingerprint(platform: str, config: Mapping[str, Any], platform_co
 
 
 class CollectionCheckpoint:
-    def __init__(
-        self,
-        platform: str,
-        window: DateWindow,
-        tz: Any,
-        config: Mapping[str, Any],
-        platform_config: Mapping[str, Any],
-    ):
+    def __init__(self, platform: str, window: DateWindow, tz: Any, config: Mapping[str, Any], platform_config: Mapping[str, Any]):
         self.platform = platform
         self.window = window
         self.tz = tz
@@ -299,19 +288,8 @@ class CollectionCheckpoint:
             return None
         return state
 
-    def save(
-        self,
-        records: Iterable[VideoRecord],
-        *,
-        phase: str,
-        next_keyword_index: int,
-        last_keyword_ids: Iterable[str],
-        detail_keys: Iterable[str],
-        completed_detail_keys: Iterable[str],
-        failed_attempts: Mapping[str, int],
-        processed_detail_count: int,
-        note: str = "",
-    ) -> None:
+    def save(self, records: Iterable[VideoRecord], *, phase: str, next_keyword_index: int, last_keyword_ids: Iterable[str], detail_keys: Iterable[str], completed_detail_keys: Iterable[str], failed_attempts: Mapping[str, int], processed_detail_count: int, note: str = "") -> None:
+        records_list = list(records)
         payload = {
             "version": CHECKPOINT_VERSION,
             "platform": self.platform,
@@ -325,167 +303,106 @@ class CollectionCheckpoint:
             "completed_detail_keys": sorted(set(completed_detail_keys)),
             "failed_attempts": {str(k): int(v) for k, v in failed_attempts.items()},
             "processed_detail_count": int(processed_detail_count),
-            "record_count": len(list(records)) if not isinstance(records, list) else len(records),
-            "updated_at": datetime.now(self.tz).isoformat(),
+            "record_count": len(records_list),
+            "records": [record.to_dict(self.tz) for record in records_list],
             "note": note,
-            "records": [record.to_dict() for record in records],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         atomic_save_json(self.path, payload)
 
-    def delete(self) -> None:
-        try:
+
+class RunLock:
+    def __init__(self, name: str, stale_hours: float):
+        self.path = DATA_DIR / "locks" / f"{name}.lock"
+        self.stale_seconds = max(3600.0, float(stale_hours) * 3600.0)
+        self.token = f"{os.getpid()}-{time.time_ns()}"
+        self.acquired = False
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            try:
+                info = json.loads(self.path.read_text(encoding="utf-8"))
+                age = time.time() - self.path.stat().st_mtime
+            except Exception:
+                info, age = {}, 0
+            if age < self.stale_seconds:
+                raise RuntimeError(f"另一个任务可能正在运行：{self.path}（PID={info.get('pid', 'unknown')}）")
+            logging.warning("发现过期任务锁，自动移除：%s", self.path)
             self.path.unlink(missing_ok=True)
+        payload = {"pid": os.getpid(), "token": self.token, "created_at": datetime.now(timezone.utc).isoformat()}
+        atomic_save_json(self.path, payload)
+        self.acquired = True
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        try:
+            info = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+            if info.get("token") == self.token:
+                self.path.unlink(missing_ok=True)
         except Exception:
             pass
+        self.acquired = False
+
+    def __enter__(self) -> "RunLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.release()
 
 
-def _process_is_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        if os.name == "nt":
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                timeout=8,
-                check=False,
-            )
-            return f'"{pid}"' in result.stdout
-        os.kill(pid, 0)
-        return True
-    except Exception:
-        return False
-
-
-@contextmanager
-def acquire_run_lock(window: DateWindow, config: Mapping[str, Any]):
-    """Prevent two collectors from using the same persistent browser profile at once."""
-    lock_dir = DATA_DIR / "locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / f"weekly_{window.slug}.lock"
-    stale_hours = float(config.get("browser", {}).get("lock_stale_hours", 12))
-    token = f"{os.getpid()}-{time.time_ns()}"
-    if lock_path.exists():
-        try:
-            existing = json.loads(lock_path.read_text(encoding="utf-8"))
-        except Exception:
-            existing = {}
-        pid = int(existing.get("pid", 0) or 0)
-        age_hours = max(0.0, (time.time() - lock_path.stat().st_mtime) / 3600.0)
-        if _process_is_alive(pid) and age_hours < stale_hours:
-            raise CollectorNeedsAttention(
-                f"已有采集任务正在运行（PID {pid}）。请勿同时双击 run_weekly.bat 和 run_visible.bat。"
-            )
-        logging.warning("发现失效任务锁，已自动清理：%s", lock_path)
-        lock_path.unlink(missing_ok=True)
-    atomic_save_json(lock_path, {
-        "pid": os.getpid(), "token": token, "created_at": datetime.now(timezone.utc).isoformat()
-    })
-    try:
-        yield lock_path
-    finally:
-        try:
-            current = json.loads(lock_path.read_text(encoding="utf-8")) if lock_path.exists() else {}
-            if current.get("token") == token:
-                lock_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-class RecordStore:
-    def __init__(self, platform: str):
-        self.platform = platform
-        self._records: dict[str, VideoRecord] = {}
-
-    def add(self, record: VideoRecord) -> None:
-        if record.platform != self.platform:
-            return
-        if not record.video_id and not record.url:
-            return
-        key = record.key()
-        existing = self._records.get(key)
-        if existing is None:
-            self._records[key] = record
-            return
-        self._records[key] = merge_records(existing, record)
-
-    def values(self) -> list[VideoRecord]:
-        return list(self._records.values())
-
-    def __len__(self) -> int:
-        return len(self._records)
-
-
-def setup_logging() -> None:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    handlers = [logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler(sys.stdout)]
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=handlers,
-        force=True,
-    )
-
-
-def load_config() -> dict[str, Any]:
-    if not CONFIG_PATH.exists():
-        raise FileNotFoundError(f"缺少配置文件：{CONFIG_PATH}")
-    with CONFIG_PATH.open("r", encoding="utf-8") as f:
-        config = yaml.safe_load(f) or {}
+def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"配置文件不存在：{path}")
+    with path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
+    if not isinstance(config, dict):
+        raise ValueError("config.yaml 根节点必须是对象。")
     return config
 
 
-def resolve_timezone(name: str):
-    """Load an IANA timezone and provide a safe Windows fallback for China time.
-
-    Windows Python installations do not always include the IANA timezone database.
-    The tzdata package is installed by requirements.txt, but the fixed UTC+8 fallback
-    keeps the Douyin-only workflow usable even if that package is missing.
-    """
+def get_timezone(config: Mapping[str, Any]) -> Any:
+    key = str(config.get("timezone", "Asia/Shanghai"))
     try:
-        return ZoneInfo(name)
-    except ZoneInfoNotFoundError:
-        fixed_offsets = {
-            "Asia/Shanghai": 8,
-            "Asia/Chongqing": 8,
-            "Asia/Hong_Kong": 8,
-            "Asia/Taipei": 8,
-        }
-        if name in fixed_offsets:
-            logging.warning(
-                "Timezone database is unavailable; using fixed UTC%+d fallback for %s.",
-                fixed_offsets[name],
-                name,
-            )
-            return timezone(timedelta(hours=fixed_offsets[name]), name=name)
-        raise RuntimeError(
-            f"无法加载时区 {name!r}。请运行 install.bat，或在虚拟环境中安装 tzdata："
-            r".venv\Scripts\python.exe -m pip install tzdata"
-        )
+        return ZoneInfo(key)
+    except (ZoneInfoNotFoundError, ModuleNotFoundError):
+        if key in {"Asia/Shanghai", "PRC", "Etc/GMT-8"}:
+            logging.warning("系统缺少 tzdata，使用固定 UTC+8；不会影响本工具的中国时区统计。")
+            return timezone(timedelta(hours=8), name="Asia/Shanghai")
+        logging.warning("找不到时区 %s，使用系统本地时区。", key)
+        return datetime.now().astimezone().tzinfo or timezone.utc
 
 
-def compute_window(config: Mapping[str, Any], now: Optional[datetime] = None) -> tuple[DateWindow, Any]:
-    tz = resolve_timezone(str(config.get("timezone", "Asia/Shanghai")))
-    now_local = (now or datetime.now(tz)).astimezone(tz)
-    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    mode = str(config.get("window_mode", "previous_7_complete_days"))
-    if mode == "previous_calendar_week":
-        this_monday = today_start - timedelta(days=today_start.weekday())
-        start = this_monday - timedelta(days=7)
-        end = this_monday
-    elif mode == "previous_7_complete_days":
-        end = today_start
-        start = end - timedelta(days=7)
-    else:
-        raise ValueError(f"不支持的 window_mode：{mode}")
-    return DateWindow(start=start, end=end, mode=mode), tz
-
-
-def normalize_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return re.sub(r"\s+", " ", str(value)).strip()
+def parse_datetime(value: Any) -> Optional[datetime]:
+    if value in (None, "", 0, "0"):
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number > 1e12:
+            number /= 1000.0
+        try:
+            return datetime.fromtimestamp(number, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
+    text = str(value).strip()
+    if text.isdigit():
+        return parse_datetime(int(text))
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    patterns = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"]
+    for fmt in patterns:
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
 
 
 def parse_count(value: Any) -> int:
@@ -494,860 +411,872 @@ def parse_count(value: Any) -> int:
     if isinstance(value, bool):
         return int(value)
     if isinstance(value, (int, float)):
-        if math.isnan(value) if isinstance(value, float) else False:
-            return 0
         return max(0, int(value))
-    text = str(value).strip().replace(",", "").replace("+", "")
-    if not text:
-        return 0
-    try:
-        return max(0, int(float(text)))
-    except ValueError:
-        pass
+    text = str(value).replace(",", "").strip()
     match = COUNT_PATTERN.search(text)
     if not match:
         return 0
     number = float(match.group(1))
-    unit = match.group(2).lower()
-    multiplier = {
-        "": 1,
-        "千": 1_000,
-        "k": 1_000,
-        "万": 10_000,
-        "m": 1_000_000,
-        "亿": 100_000_000,
-        "b": 1_000_000_000,
-    }.get(unit, 1)
+    suffix = match.group(2).lower()
+    multiplier = {"": 1, "千": 1_000, "k": 1_000, "万": 10_000, "m": 1_000_000, "亿": 100_000_000, "b": 1_000_000_000}.get(suffix, 1)
     return max(0, int(number * multiplier))
 
 
-def parse_datetime(value: Any) -> Optional[datetime]:
-    if value in (None, "", 0, "0"):
-        return None
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().isdigit()):
-        try:
-            number = float(value)
-            if number > 10_000_000_000:
-                number /= 1000.0
-            if number < 946684800:  # 2000-01-01 前大概率不是有效短视频时间戳
-                return None
-            return datetime.fromtimestamp(number, tz=timezone.utc)
-        except (ValueError, OSError, OverflowError):
-            return None
-    text = str(value).strip()
-    text = text.replace("Z", "+00:00")
-    for parser in (
-        lambda t: datetime.fromisoformat(t),
-        lambda t: datetime.strptime(t, "%Y-%m-%d %H:%M:%S"),
-        lambda t: datetime.strptime(t, "%Y-%m-%d"),
-    ):
-        try:
-            dt = parser(text)
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-    return None
-
-
-def deep_get(obj: Mapping[str, Any], *paths: str, default: Any = None) -> Any:
-    for path in paths:
-        cur: Any = obj
-        ok = True
-        for part in path.split("."):
-            if not isinstance(cur, Mapping) or part not in cur:
-                ok = False
-                break
-            cur = cur[part]
-        if ok and cur not in (None, ""):
-            return cur
-    return default
-
-
-def first_url(value: Any) -> str:
-    if isinstance(value, str):
-        return value if value.startswith("http") else ""
-    if isinstance(value, list):
-        for item in value:
-            url = first_url(item)
-            if url:
-                return url
-    if isinstance(value, Mapping):
-        for key in ("url_list", "urlList", "urls", "url", "src"):
-            if key in value:
-                url = first_url(value[key])
-                if url:
-                    return url
-    return ""
-
-
-def walk_dicts(obj: Any) -> Iterator[dict[str, Any]]:
-    if isinstance(obj, dict):
-        yield obj
-        for value in obj.values():
-            yield from walk_dicts(value)
-    elif isinstance(obj, list):
-        for item in obj:
-            yield from walk_dicts(item)
-
-
-def extract_hashtags(title: str, extras: Iterable[Any] = ()) -> list[str]:
-    tags: list[str] = []
-    for tag in HASHTAG_PATTERN.findall(title or ""):
-        cleaned = normalize_text(tag).lstrip("#＃")
-        if cleaned:
-            tags.append(cleaned)
-    for extra in extras:
-        if isinstance(extra, str):
-            cleaned = normalize_text(extra).lstrip("#＃")
-            if cleaned:
-                tags.append(cleaned)
-        elif isinstance(extra, Mapping):
-            candidate = deep_get(extra, "title", "name", "cha_name", "challengeName", default="")
-            cleaned = normalize_text(candidate).lstrip("#＃")
-            if cleaned:
-                tags.append(cleaned)
-    return unique_preserve(tags)
-
-
-def unique_preserve(items: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in items:
-        key = item.casefold()
-        if item and key not in seen:
-            seen.add(key)
-            out.append(item)
-    return out
+def normalize_text(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
 def canonicalize_url(url: str) -> str:
     if not url:
         return ""
-    try:
-        parsed = urllib.parse.urlsplit(url)
-        return urllib.parse.urlunsplit((parsed.scheme or "https", parsed.netloc.lower(), parsed.path.rstrip("/"), "", ""))
-    except Exception:
-        return url
+    parts = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    query = [(k, v) for k, v in query if not k.lower().startswith(("utm_", "share_"))]
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc.lower(), parts.path.rstrip("/"), urllib.parse.urlencode(query), ""))
 
 
-def merge_records(a: VideoRecord, b: VideoRecord) -> VideoRecord:
-    def better_text(x: str, y: str) -> str:
-        return y if len(normalize_text(y)) > len(normalize_text(x)) else x
-
-    a.video_id = a.video_id or b.video_id
-    a.url = a.url or b.url
-    if b.url and len(b.url) < len(a.url):
-        a.url = b.url
-    a.title = better_text(a.title, b.title)
-    a.author_name = better_text(a.author_name, b.author_name)
-    a.author_id = better_text(a.author_id, b.author_id)
-    a.create_time = a.create_time or b.create_time
-    a.views = max(a.views, b.views)
-    a.likes = max(a.likes, b.likes)
-    a.comments = max(a.comments, b.comments)
-    a.shares = max(a.shares, b.shares)
-    a.favorites = max(a.favorites, b.favorites)
-    a.followers = max(a.followers, b.followers)
-    a.music = better_text(a.music, b.music)
-    a.hashtags = unique_preserve([*a.hashtags, *b.hashtags])
-    a.thumbnail = a.thumbnail or b.thumbnail
-    source_keywords = []
-    for raw_keyword in (a.source_keyword, b.source_keyword):
-        for keyword in [part.strip() for part in raw_keyword.split("|") if part.strip()]:
-            if keyword.casefold() not in {item.casefold() for item in source_keywords}:
-                source_keywords.append(keyword)
-    a.source_keyword = " | ".join(source_keywords)
-    a.data_sources.update(b.data_sources)
-    a.data_quality_notes = unique_preserve([*a.data_quality_notes, *b.data_quality_notes])
-    return a
-
-
-def build_tiktok_url(video_id: str, author_id: str = "") -> str:
-    if author_id:
-        author_id = author_id.lstrip("@")
-        return f"https://www.tiktok.com/@{urllib.parse.quote(author_id)}/video/{video_id}"
-    return f"https://www.tiktok.com/video/{video_id}"
-
-
-def build_platform_url(platform: str, video_id: str, author_id: str = "") -> str:
-    if not video_id:
-        return ""
-    if platform == "douyin":
+def normalize_video_url(platform: str, video_id: str, url: str = "") -> str:
+    if platform == "douyin" and video_id:
         return f"https://www.douyin.com/video/{video_id}"
-    if platform == "kuaishou":
-        return f"https://www.kuaishou.com/short-video/{video_id}"
-    if platform == "tiktok":
-        return build_tiktok_url(video_id, author_id)
-    return ""
+    if platform == "kuaishou" and url:
+        return canonicalize_url(url)
+    if platform == "tiktok" and url:
+        return canonicalize_url(url)
+    return canonicalize_url(url)
 
 
-def find_platform_video_url(obj: Mapping[str, Any], platform: str) -> str:
-    candidates: list[str] = []
-    for path in (
-        "share_url", "shareUrl", "web_url", "webUrl", "jumpUrl", "photoUrl", "itemUrl", "url",
-    ):
-        value = deep_get(obj, path, default="")
-        if isinstance(value, str) and value.startswith("http"):
-            candidates.append(value)
-    for url in candidates:
-        low = url.lower()
-        if platform == "douyin" and "douyin.com" in low and "/video/" in low:
-            return canonicalize_url(url)
-        if platform == "kuaishou" and ("kuaishou.com" in low or "kwai.com" in low) and ("short-video" in low or "photo" in low):
-            return canonicalize_url(url)
-        if platform == "tiktok" and "tiktok.com" in low and "/video/" in low:
-            return canonicalize_url(url)
-    return ""
+def first_value(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    return None
 
 
-def normalize_tiktok_dict(obj: Mapping[str, Any], keyword: str, source: str) -> Optional[VideoRecord]:
-    stats = deep_get(obj, "stats", "statistics", "statsV2", default={})
-    if not isinstance(stats, Mapping):
-        stats = {}
-    video_id = normalize_text(deep_get(obj, "id", "itemId", "videoId", "item_id", default=""))
-    title = normalize_text(deep_get(obj, "desc", "description", "text", "caption", default=""))
-    has_stats = any(k in stats for k in ("playCount", "diggCount", "commentCount", "shareCount", "collectCount"))
-    if not video_id or not (title or has_stats or deep_get(obj, "createTime", "create_time")):
+def deep_get(obj: Any, *path: Any) -> Any:
+    current = obj
+    for key in path:
+        if isinstance(current, Mapping):
+            current = current.get(key)
+        elif isinstance(current, list) and isinstance(key, int) and 0 <= key < len(current):
+            current = current[key]
+        else:
+            return None
+    return current
+
+
+def extract_hashtags(title: str, raw_tags: Any = None) -> list[str]:
+    tags = {match.group(1).strip() for match in HASHTAG_PATTERN.finditer(title or "") if match.group(1).strip()}
+    if isinstance(raw_tags, list):
+        for item in raw_tags:
+            if isinstance(item, Mapping):
+                value = first_value(item.get("hashtag_name"), item.get("tag_name"), item.get("title"), item.get("name"))
+            else:
+                value = item
+            if value:
+                tags.add(normalize_text(value).lstrip("#＃"))
+    return sorted(tag for tag in tags if tag)
+
+
+def iter_dicts(value: Any) -> Iterator[dict[str, Any]]:
+    if isinstance(value, Mapping):
+        yield dict(value)
+        for child in value.values():
+            yield from iter_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from iter_dicts(child)
+
+
+def looks_like_douyin_aweme(item: Mapping[str, Any]) -> bool:
+    return bool(first_value(item.get("aweme_id"), item.get("item_id"))) and bool(first_value(item.get("desc"), item.get("statistics"), item.get("author"), item.get("video")))
+
+
+def parse_douyin_item(item: Mapping[str, Any], keyword: str, source: str) -> Optional[VideoRecord]:
+    if not looks_like_douyin_aweme(item):
         return None
-
-    author = deep_get(obj, "author", "authorInfo", "user", default={})
-    if not isinstance(author, Mapping):
-        author = {}
-    author_id = normalize_text(deep_get(author, "uniqueId", "unique_id", "username", "id", default=""))
-    author_name = normalize_text(deep_get(author, "nickname", "displayName", "name", default=author_id))
-    author_stats = deep_get(obj, "authorStats", "author.stats", "authorStatsV2", default={})
-    if not isinstance(author_stats, Mapping):
-        author_stats = {}
-    challenges = deep_get(obj, "challenges", "textExtra", "hashtags", default=[])
-    if not isinstance(challenges, list):
-        challenges = []
-    music_obj = deep_get(obj, "music", "musicInfo", default={})
-    music = ""
-    if isinstance(music_obj, Mapping):
-        music = normalize_text(deep_get(music_obj, "title", "musicName", "name", default=""))
-        music_author = normalize_text(deep_get(music_obj, "authorName", "author", default=""))
-        if music_author and music_author.casefold() not in music.casefold():
-            music = f"{music} - {music_author}" if music else music_author
-    thumbnail = first_url(deep_get(obj, "video.cover", "video.dynamicCover", "video.originCover", "cover", default=""))
-    url = find_platform_video_url(obj, "tiktok") or build_tiktok_url(video_id, author_id)
-    return VideoRecord(
-        platform="tiktok",
-        video_id=video_id,
-        url=url,
-        title=title,
-        author_name=author_name,
-        author_id=author_id,
-        create_time=parse_datetime(deep_get(obj, "createTime", "create_time", "create_time_iso", default=None)),
-        views=parse_count(deep_get(stats, "playCount", "viewCount", "play_count", default=0)),
-        likes=parse_count(deep_get(stats, "diggCount", "likeCount", "digg_count", default=0)),
-        comments=parse_count(deep_get(stats, "commentCount", "comment_count", default=0)),
-        shares=parse_count(deep_get(stats, "shareCount", "share_count", default=0)),
-        favorites=parse_count(deep_get(stats, "collectCount", "favoriteCount", "saveCount", default=0)),
-        followers=parse_count(deep_get(author_stats, "followerCount", "followers", default=deep_get(author, "followerCount", default=0))),
-        music=music,
-        hashtags=extract_hashtags(title, challenges),
-        thumbnail=thumbnail,
-        source_keyword=keyword,
-        data_sources={source},
-    )
-
-
-def normalize_douyin_dict(obj: Mapping[str, Any], keyword: str, source: str) -> Optional[VideoRecord]:
-    # 常见数据对象可能在 aweme_info / aweme / item 下，walk_dicts 会继续进入，这里只处理本层。
-    stats = deep_get(obj, "statistics", "stats", default={})
-    if not isinstance(stats, Mapping):
-        stats = {}
-    video_id = normalize_text(deep_get(obj, "aweme_id", "awemeId", "item_id", "itemId", default=""))
-    title = normalize_text(deep_get(obj, "desc", "description", "caption", "title", default=""))
-    has_stats = any(k in stats for k in ("play_count", "digg_count", "comment_count", "share_count", "collect_count"))
-    if not video_id or not (title or has_stats or deep_get(obj, "create_time", "createTime")):
-        return None
-
-    author = deep_get(obj, "author", "author_info", "user", default={})
-    if not isinstance(author, Mapping):
-        author = {}
-    author_id = normalize_text(deep_get(author, "unique_id", "short_id", "sec_uid", "uid", default=""))
-    author_name = normalize_text(deep_get(author, "nickname", "name", default=author_id))
-    cha_list = deep_get(obj, "cha_list", "challenges", "text_extra", "hashtags", default=[])
-    if not isinstance(cha_list, list):
-        cha_list = []
-    music_obj = deep_get(obj, "music", "music_info", default={})
-    music = normalize_text(deep_get(music_obj, "title", "music_name", "name", default="")) if isinstance(music_obj, Mapping) else ""
-    thumbnail = first_url(deep_get(obj, "video.cover", "video.origin_cover", "video.dynamic_cover", "cover", default=""))
-    url = find_platform_video_url(obj, "douyin") or build_platform_url("douyin", video_id, author_id)
-    return VideoRecord(
+    video_id = str(first_value(item.get("aweme_id"), item.get("item_id"), item.get("id")) or "")
+    statistics = first_value(item.get("statistics"), item.get("stats"), {}) or {}
+    author = first_value(item.get("author"), {}) or {}
+    video = first_value(item.get("video"), {}) or {}
+    title = normalize_text(first_value(item.get("desc"), item.get("title"), item.get("share_info", {}).get("share_title")))
+    hashtags = extract_hashtags(title, first_value(item.get("text_extra"), item.get("cha_list")))
+    thumbnail = first_value(deep_get(video, "cover", "url_list", 0), deep_get(video, "origin_cover", "url_list", 0), deep_get(video, "dynamic_cover", "url_list", 0), item.get("cover")) or ""
+    record = VideoRecord(
         platform="douyin",
         video_id=video_id,
-        url=url,
+        url=normalize_video_url("douyin", video_id, str(item.get("share_url") or "")),
         title=title,
-        author_name=author_name,
-        author_id=author_id,
-        create_time=parse_datetime(deep_get(obj, "create_time", "createTime", default=None)),
-        views=parse_count(deep_get(stats, "play_count", "playCount", "view_count", default=0)),
-        likes=parse_count(deep_get(stats, "digg_count", "diggCount", "like_count", default=0)),
-        comments=parse_count(deep_get(stats, "comment_count", "commentCount", default=0)),
-        shares=parse_count(deep_get(stats, "share_count", "shareCount", default=0)),
-        favorites=parse_count(deep_get(stats, "collect_count", "collectCount", "favorite_count", default=0)),
-        followers=parse_count(deep_get(author, "follower_count", "followerCount", default=0)),
-        music=music,
-        hashtags=extract_hashtags(title, cha_list),
-        thumbnail=thumbnail,
+        author_name=normalize_text(first_value(author.get("nickname"), item.get("author_name"))),
+        author_id=str(first_value(author.get("sec_uid"), author.get("uid"), author.get("unique_id"), item.get("author_id")) or ""),
+        create_time=parse_datetime(first_value(item.get("create_time"), item.get("createTime"), item.get("timestamp"))),
+        views=parse_count(first_value(statistics.get("play_count"), statistics.get("playCount"), statistics.get("view_count"))),
+        likes=parse_count(first_value(statistics.get("digg_count"), statistics.get("like_count"), statistics.get("diggCount"))),
+        comments=parse_count(first_value(statistics.get("comment_count"), statistics.get("commentCount"))),
+        shares=parse_count(first_value(statistics.get("share_count"), statistics.get("shareCount"))),
+        favorites=parse_count(first_value(statistics.get("collect_count"), statistics.get("collectCount"))),
+        followers=parse_count(first_value(author.get("follower_count"), author.get("mplatform_followers_count"))),
+        music=normalize_text(first_value(deep_get(item, "music", "title"), deep_get(item, "music", "music_name"))),
+        hashtags=hashtags,
+        thumbnail=str(thumbnail),
         source_keyword=keyword,
         data_sources={source},
     )
-
-
-def normalize_kuaishou_dict(obj: Mapping[str, Any], keyword: str, source: str) -> Optional[VideoRecord]:
-    # 快手 GraphQL 中经常有 photo 子对象；walk_dicts 会递归处理 photo，本层也兼容扁平对象。
-    stats = deep_get(obj, "statistics", "stats", default={})
-    if not isinstance(stats, Mapping):
-        stats = {}
-    video_id = normalize_text(deep_get(obj, "photoId", "photo_id", "photoid", "workId", "itemId", default=""))
-    title = normalize_text(deep_get(obj, "caption", "title", "description", "desc", default=""))
-    direct_stat_keys = ("viewCount", "playCount", "likeCount", "commentCount", "shareCount")
-    has_stats = any(k in obj for k in direct_stat_keys) or bool(stats)
-    if not video_id or not (title or has_stats or deep_get(obj, "timestamp", "createTime", "create_time")):
+    if not record.video_id:
         return None
+    return record
 
-    author = deep_get(obj, "author", "user", "userInfo", "owner", default={})
-    if not isinstance(author, Mapping):
-        author = {}
-    author_id = normalize_text(deep_get(author, "kwaiId", "userId", "id", "principalId", default=""))
-    author_name = normalize_text(deep_get(author, "name", "user_name", "nickname", default=author_id))
-    tags = deep_get(obj, "hashtags", "tags", "topics", default=[])
-    if not isinstance(tags, list):
-        tags = []
-    music_obj = deep_get(obj, "music", "musicInfo", "soundTrack", default={})
-    music = normalize_text(deep_get(music_obj, "name", "title", "musicName", default="")) if isinstance(music_obj, Mapping) else ""
-    thumbnail = first_url(deep_get(obj, "coverUrl", "coverUrls", "cover", "thumbnailUrl", default=""))
-    url = find_platform_video_url(obj, "kuaishou") or build_platform_url("kuaishou", video_id, author_id)
+
+def looks_like_kuaishou_item(item: Mapping[str, Any]) -> bool:
+    return bool(first_value(item.get("photoId"), item.get("photo_id"), item.get("id"))) and bool(first_value(item.get("caption"), item.get("user"), item.get("likeCount"), item.get("viewCount")))
+
+
+def parse_kuaishou_item(item: Mapping[str, Any], keyword: str, source: str) -> Optional[VideoRecord]:
+    if not looks_like_kuaishou_item(item):
+        return None
+    video_id = str(first_value(item.get("photoId"), item.get("photo_id"), item.get("id")) or "")
+    user = first_value(item.get("user"), item.get("author"), {}) or {}
+    title = normalize_text(first_value(item.get("caption"), item.get("title"), item.get("description")))
+    url = str(first_value(item.get("shareUrl"), item.get("url"), item.get("photoUrl")) or "")
     return VideoRecord(
         platform="kuaishou",
         video_id=video_id,
-        url=url,
+        url=normalize_video_url("kuaishou", video_id, url),
         title=title,
-        author_name=author_name,
-        author_id=author_id,
-        create_time=parse_datetime(deep_get(obj, "timestamp", "createTime", "create_time", "uploadTime", default=None)),
-        views=parse_count(deep_get(obj, "viewCount", "playCount", "play_count", default=deep_get(stats, "viewCount", "playCount", default=0))),
-        likes=parse_count(deep_get(obj, "likeCount", "realLikeCount", "like_count", default=deep_get(stats, "likeCount", default=0))),
-        comments=parse_count(deep_get(obj, "commentCount", "comment_count", default=deep_get(stats, "commentCount", default=0))),
-        shares=parse_count(deep_get(obj, "shareCount", "share_count", default=deep_get(stats, "shareCount", default=0))),
-        favorites=parse_count(deep_get(obj, "collectCount", "favoriteCount", "collect_count", default=deep_get(stats, "collectCount", default=0))),
-        followers=parse_count(deep_get(author, "fan", "fansCount", "followerCount", "followers", default=0)),
-        music=music,
-        hashtags=extract_hashtags(title, tags),
-        thumbnail=thumbnail,
+        author_name=normalize_text(first_value(user.get("name"), user.get("userName"), item.get("userName"))),
+        author_id=str(first_value(user.get("id"), user.get("userId"), item.get("userId")) or ""),
+        create_time=parse_datetime(first_value(item.get("timestamp"), item.get("createTime"), item.get("create_time"))),
+        views=parse_count(first_value(item.get("viewCount"), item.get("playCount"), item.get("browseCount"))),
+        likes=parse_count(first_value(item.get("likeCount"), item.get("realLikeCount"))),
+        comments=parse_count(first_value(item.get("commentCount"), item.get("comment_count"))),
+        shares=parse_count(first_value(item.get("shareCount"), item.get("share_count"))),
+        favorites=parse_count(first_value(item.get("collectCount"), item.get("favoriteCount"))),
+        followers=parse_count(first_value(user.get("fanCount"), user.get("fansCount"))),
+        music=normalize_text(first_value(deep_get(item, "music", "name"), item.get("musicName"))),
+        hashtags=extract_hashtags(title, item.get("tagItems")),
+        thumbnail=str(first_value(item.get("coverUrl"), item.get("thumbnailUrl"), item.get("cover")) or ""),
         source_keyword=keyword,
         data_sources={source},
     )
 
 
-NORMALIZERS: dict[str, Callable[[Mapping[str, Any], str, str], Optional[VideoRecord]]] = {
-    "douyin": normalize_douyin_dict,
-    "kuaishou": normalize_kuaishou_dict,
-    "tiktok": normalize_tiktok_dict,
-}
+def looks_like_tiktok_item(item: Mapping[str, Any]) -> bool:
+    return bool(first_value(item.get("id"), item.get("itemId"))) and bool(first_value(item.get("desc"), item.get("stats"), item.get("author"), item.get("video")))
 
 
-def parse_payload(platform: str, payload: Any, keyword: str, source: str, store: RecordStore) -> int:
-    before = len(store)
-    normalizer = NORMALIZERS[platform]
-    for obj in walk_dicts(payload):
-        try:
-            record = normalizer(obj, keyword, source)
-            if record:
-                store.add(record)
-        except Exception as exc:
-            logging.debug("normalize failed %s: %s", platform, exc)
-    return len(store) - before
+def parse_tiktok_item(item: Mapping[str, Any], keyword: str, source: str) -> Optional[VideoRecord]:
+    if not looks_like_tiktok_item(item):
+        return None
+    video_id = str(first_value(item.get("id"), item.get("itemId")) or "")
+    author = first_value(item.get("author"), {}) or {}
+    stats = first_value(item.get("stats"), {}) or {}
+    author_name = normalize_text(first_value(author.get("uniqueId"), author.get("nickname"), item.get("author")))
+    url = str(first_value(item.get("shareUrl"), item.get("webVideoUrl")) or "")
+    if not url and author_name and video_id:
+        url = f"https://www.tiktok.com/@{author_name}/video/{video_id}"
+    title = normalize_text(first_value(item.get("desc"), item.get("title")))
+    return VideoRecord(
+        platform="tiktok",
+        video_id=video_id,
+        url=normalize_video_url("tiktok", video_id, url),
+        title=title,
+        author_name=author_name,
+        author_id=str(first_value(author.get("id"), author.get("secUid"), author.get("uniqueId")) or ""),
+        create_time=parse_datetime(first_value(item.get("createTime"), item.get("create_time"))),
+        views=parse_count(first_value(stats.get("playCount"), stats.get("viewCount"))),
+        likes=parse_count(first_value(stats.get("diggCount"), stats.get("likeCount"))),
+        comments=parse_count(first_value(stats.get("commentCount"), stats.get("comment_count"))),
+        shares=parse_count(first_value(stats.get("shareCount"), stats.get("share_count"))),
+        favorites=parse_count(first_value(stats.get("collectCount"), stats.get("saveCount"))),
+        followers=parse_count(first_value(author.get("followerCount"), deep_get(item, "authorStats", "followerCount"))),
+        music=normalize_text(first_value(deep_get(item, "music", "title"), deep_get(item, "music", "authorName"))),
+        hashtags=extract_hashtags(title, item.get("challenges")),
+        thumbnail=str(first_value(deep_get(item, "video", "cover"), deep_get(item, "video", "dynamicCover")) or ""),
+        source_keyword=keyword,
+        data_sources={source},
+    )
 
 
-def extract_video_id_from_url(platform: str, url: str) -> str:
-    patterns = {
-        "douyin": [r"/video/(\d+)", r"modal_id=(\d+)"],
-        "kuaishou": [r"/short-video/([A-Za-z0-9_-]+)", r"photoId=([A-Za-z0-9_-]+)"],
-        "tiktok": [r"/video/(\d+)"],
-    }
-    for pattern in patterns.get(platform, []):
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return ""
+def parse_json_records(platform: str, payload: Any, keyword: str, source: str) -> list[VideoRecord]:
+    parser = {"douyin": parse_douyin_item, "kuaishou": parse_kuaishou_item, "tiktok": parse_tiktok_item}[platform]
+    records: list[VideoRecord] = []
+    seen: set[str] = set()
+    for item in iter_dicts(payload):
+        record = parser(item, keyword, source)
+        if record and record.key() not in seen:
+            seen.add(record.key())
+            records.append(record)
+    return records
 
 
-def is_platform_video_url(platform: str, url: str) -> bool:
-    low = url.lower()
+def response_is_search_candidate(platform: str, url: str, current_search: bool = False) -> bool:
+    lower = url.lower()
     if platform == "douyin":
-        return "douyin.com" in low and ("/video/" in low or "modal_id=" in low)
+        return "search" in lower and any(token in lower for token in ("aweme", "item", "general", "video"))
     if platform == "kuaishou":
-        return ("kuaishou.com" in low or "kwai.com" in low) and ("short-video" in low or "photoid=" in low)
+        return "search" in lower and any(token in lower for token in ("photo", "feed", "graphql"))
     if platform == "tiktok":
-        return "tiktok.com" in low and "/video/" in low
+        return "search" in lower and any(token in lower for token in ("item", "video", "general"))
+    return current_search and "search" in lower
+
+
+def response_is_detail_candidate(platform: str, url: str) -> bool:
+    lower = url.lower()
+    if platform == "douyin":
+        return any(token in lower for token in ("aweme/detail", "aweme/v1/web/aweme/detail", "iteminfo"))
+    if platform == "kuaishou":
+        return any(token in lower for token in ("photo", "detail", "graphql"))
+    if platform == "tiktok":
+        return any(token in lower for token in ("item/detail", "iteminfo"))
     return False
 
 
-def search_url(platform: str, keyword: str) -> str:
-    encoded = urllib.parse.quote(keyword)
-    if platform == "douyin":
-        return f"https://www.douyin.com/search/{encoded}?type=video"
-    if platform == "kuaishou":
-        return f"https://www.kuaishou.com/search/video?searchKey={encoded}"
-    if platform == "tiktok":
-        return f"https://www.tiktok.com/search/video?q={encoded}"
-    raise ValueError(platform)
+def merge_record(target: VideoRecord, source: VideoRecord) -> VideoRecord:
+    text_fields = ["url", "title", "author_name", "author_id", "music", "thumbnail"]
+    numeric_fields = ["views", "likes", "comments", "shares", "favorites", "followers"]
+    for field_name in text_fields:
+        source_value = getattr(source, field_name)
+        if source_value and (not getattr(target, field_name) or len(str(source_value)) > len(str(getattr(target, field_name)))):
+            setattr(target, field_name, source_value)
+    for field_name in numeric_fields:
+        setattr(target, field_name, max(int(getattr(target, field_name) or 0), int(getattr(source, field_name) or 0)))
+    if source.create_time and (not target.create_time or source.create_time < target.create_time):
+        target.create_time = source.create_time
+    target.hashtags = sorted(set(target.hashtags) | set(source.hashtags))
+    target.data_sources |= source.data_sources
+    target.data_quality_notes = sorted(set(target.data_quality_notes) | set(source.data_quality_notes))
+    if source.source_keyword and not target.source_keyword:
+        target.source_keyword = source.source_keyword
+    return target
 
 
-class PlatformCollector:
-    def __init__(
-        self,
-        playwright: Playwright,
-        platform: str,
-        config: Mapping[str, Any],
-        platform_config: Mapping[str, Any],
-        debug_dir: Path,
-        headless_override: Optional[bool] = None,
-        background_offscreen: bool = False,
-    ):
-        self.playwright = playwright
+def add_records(store: dict[str, VideoRecord], records: Iterable[VideoRecord]) -> None:
+    for record in records:
+        key = record.key()
+        if key in store:
+            merge_record(store[key], record)
+        else:
+            store[key] = record
+
+
+def record_text(record: VideoRecord) -> str:
+    return " ".join([record.title, record.author_name, record.music, " ".join(record.hashtags), record.source_keyword]).lower()
+
+
+def contains_term(text: str, terms: Iterable[str]) -> bool:
+    lower = text.lower()
+    return any(str(term).lower() in lower for term in terms if str(term).strip())
+
+
+def compute_content_signals(record: VideoRecord, config: Mapping[str, Any]) -> None:
+    filters = config.get("filters", {})
+    text = record_text(record)
+    dance_terms = set(DANCE_TERMS)
+    sexy_terms = set(SEXY_STYLE_TERMS) | set(filters.get("sexy_style_terms", []) or [])
+    female_terms = set(FEMALE_TARGET_TERMS) | set(filters.get("female_text_terms", []) or [])
+    solo_terms = set(SOLO_TARGET_TERMS) | set(filters.get("solo_terms", []) or [])
+    male_terms = set(MALE_EXCLUDE_TERMS) | set(filters.get("male_terms", []) or [])
+    group_terms = set(GROUP_EXCLUDE_TERMS) | set(filters.get("group_terms", []) or [])
+    format_terms = set(FORMAT_EXCLUDE_TERMS) | set(filters.get("format_exclude_terms", []) or [])
+    non_human_terms = set(NON_HUMAN_EXCLUDE_TERMS) | set(filters.get("non_human_terms", []) or [])
+    minor_terms = set(filters.get("minor_terms", []) or [])
+
+    reasons: list[str] = []
+    if contains_term(text, male_terms):
+        reasons.append("明确男性文本")
+    if contains_term(text, group_terms):
+        reasons.append("多人/双人/群舞文本")
+    if contains_term(text, format_terms):
+        reasons.append("教程/合集/搬运等格式")
+    if contains_term(text, non_human_terms):
+        reasons.append("AI/动漫/虚拟内容")
+    if filters.get("exclude_minor_text_signals", True) and contains_term(text, minor_terms):
+        reasons.append("明确未成年人文本")
+
+    record.female_text_signal = contains_term(text, female_terms)
+    record.solo_text_signal = contains_term(text, solo_terms)
+    record.sexy_style_signal = contains_term(text, sexy_terms)
+
+    dance_hits = sum(1 for term in dance_terms if term.lower() in text)
+    style_hits = sum(1 for term in sexy_terms if term.lower() in text)
+    female_hits = sum(1 for term in female_terms if term.lower() in text)
+    solo_hits = sum(1 for term in solo_terms if term.lower() in text)
+
+    record.dance_relevance = min(100.0, dance_hits * 16.0 + style_hits * 8.0 + min(10.0, len(record.hashtags) * 1.5))
+    record.target_match_score = min(100.0, dance_hits * 12.0 + style_hits * 11.0 + female_hits * 8.0 + solo_hits * 8.0)
+    if record.target_match_score >= 55:
+        record.match_level = "A-强匹配"
+    elif record.target_match_score >= 28:
+        record.match_level = "B-较匹配"
+    else:
+        record.match_level = "C-宽松候选"
+    record.exclusion_reason = "；".join(reasons)
+
+
+def prefilter_record(record: VideoRecord, config: Mapping[str, Any]) -> bool:
+    compute_content_signals(record, config)
+    if record.exclusion_reason:
+        return False
+    filters = config.get("filters", {})
+    minimum_target = float(filters.get("minimum_target_match", 8))
+    minimum_dance = float(filters.get("minimum_dance_relevance", 12))
+    return record.target_match_score >= minimum_target or record.dance_relevance >= minimum_dance
+
+
+def within_window(record: VideoRecord, window: DateWindow, tz: Any) -> bool:
+    local_dt = record.local_create_time(tz)
+    return bool(local_dt and window.start <= local_dt < window.end)
+
+
+def calculate_window(config: Mapping[str, Any], tz: Any, now: Optional[datetime] = None) -> DateWindow:
+    now_local = now.astimezone(tz) if now else datetime.now(tz)
+    mode = str(config.get("window_mode", "previous_7_complete_days"))
+    if mode == "previous_calendar_week":
+        this_monday = (now_local - timedelta(days=now_local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        return DateWindow(this_monday - timedelta(days=7), this_monday, mode)
+    today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return DateWindow(today - timedelta(days=7), today, mode)
+
+
+def percentile_map(values: Mapping[str, float]) -> dict[str, float]:
+    sorted_items = sorted(values.items(), key=lambda item: item[1])
+    n = len(sorted_items)
+    if n <= 1:
+        return {key: 100.0 for key, _ in sorted_items}
+    result: dict[str, float] = {}
+    index = 0
+    while index < n:
+        end = index
+        while end + 1 < n and sorted_items[end + 1][1] == sorted_items[index][1]:
+            end += 1
+        rank = (index + end) / 2.0
+        percentile = 100.0 * rank / (n - 1)
+        for pos in range(index, end + 1):
+            result[sorted_items[pos][0]] = percentile
+        index = end + 1
+    return result
+
+
+def score_records(records: list[VideoRecord], config: Mapping[str, Any], tz: Any, captured_at: Optional[datetime] = None) -> list[VideoRecord]:
+    captured_at = captured_at or datetime.now(timezone.utc)
+    weights = config.get("scoring", {})
+    for record in records:
+        compute_content_signals(record, config)
+        create_time = record.create_time
+        if create_time and create_time.tzinfo is None:
+            create_time = create_time.replace(tzinfo=timezone.utc)
+        hours = max(1.0, (captured_at - create_time.astimezone(timezone.utc)).total_seconds() / 3600.0) if create_time else 0.0
+        record.likes_per_hour = record.likes / hours if hours else 0.0
+        record.velocity_per_hour = record.likes_per_hour
+        if record.followers > 0:
+            record.engagement_rate = (record.likes + record.comments + record.shares + record.favorites) / record.followers
+            record.engagement_basis = "followers"
+        elif record.views > 0:
+            record.engagement_rate = (record.likes + record.comments + record.shares + record.favorites) / record.views
+            record.engagement_basis = "views"
+        else:
+            record.engagement_rate = 0.0
+            record.engagement_basis = "missing"
+
+    metrics = {
+        "like": percentile_map({record.key(): float(record.likes) for record in records}),
+        "comment": percentile_map({record.key(): float(record.comments) for record in records}),
+        "share": percentile_map({record.key(): float(record.shares) for record in records}),
+        "favorite": percentile_map({record.key(): float(record.favorites) for record in records}),
+        "velocity": percentile_map({record.key(): float(record.likes_per_hour) for record in records}),
+        "target": percentile_map({record.key(): float(record.target_match_score) for record in records}),
+    }
+    for record in records:
+        key = record.key()
+        record.like_percentile = metrics["like"].get(key, 0.0)
+        record.comment_percentile = metrics["comment"].get(key, 0.0)
+        record.share_percentile = metrics["share"].get(key, 0.0)
+        record.favorite_percentile = metrics["favorite"].get(key, 0.0)
+        record.velocity_percentile = metrics["velocity"].get(key, 0.0)
+        record.target_percentile = metrics["target"].get(key, 0.0)
+        record.final_score = (
+            record.like_percentile * float(weights.get("likes", 0.25))
+            + record.share_percentile * float(weights.get("shares", 0.20))
+            + record.favorite_percentile * float(weights.get("favorites", 0.15))
+            + record.comment_percentile * float(weights.get("comments", 0.10))
+            + record.velocity_percentile * float(weights.get("likes_velocity", 0.20))
+            + record.target_percentile * float(weights.get("target_match", 0.10))
+        )
+    ranked = sorted(records, key=lambda record: (record.final_score, record.likes, record.shares, record.favorites), reverse=True)
+    for index, record in enumerate(ranked, 1):
+        record.rank = index
+    return ranked
+
+
+class BaseCollector:
+    def __init__(self, platform: str, config: Mapping[str, Any], platform_config: Mapping[str, Any], tz: Any, window: DateWindow, visible: bool, background: bool = False):
         self.platform = platform
         self.config = config
         self.platform_config = platform_config
-        self.browser_config = config.get("browser", {})
-        self.profile_path = PROFILE_DIR / platform
-        self.debug_dir = debug_dir / platform
-        self.debug_dir.mkdir(parents=True, exist_ok=True)
-        self.store = RecordStore(platform)
+        self.tz = tz
+        self.window = window
+        self.visible = visible
+        self.background = background
+        self.label = PLATFORM_LABELS[platform]
+        self.context: Optional[BrowserContext] = None
+        self.page: Optional[Page] = None
         self.current_keyword = ""
-        self.response_seen = 0
-        self.response_parsed = 0
-        self.response_errors = 0
-        self.captcha_count = 0
-        self.capture_mode = "idle"
-        self.active_store: RecordStore = self.store
-        self.active_video_id = ""
-        self.active_search_response_count = 0
-        self.last_keyword_ids: set[str] = set()
-        configured_headless = bool(self.browser_config.get("headless", True))
-        self.is_background_offscreen = bool(background_offscreen)
-        # Douyin may return empty search payloads in true headless mode.  The weekly
-        # background launcher therefore uses a normal headed Chromium window placed
-        # far outside the visible desktop.  It keeps normal rendering/login behavior
-        # while remaining unattended.
-        if self.is_background_offscreen:
-            self.is_headless = False
-        else:
-            self.is_headless = configured_headless if headless_override is None else bool(headless_override)
-        self.is_unattended = self.is_headless or self.is_background_offscreen
+        self.response_records: list[VideoRecord] = []
+        self.search_response_count = 0
+        self.detail_response_count = 0
+        self.debug_dir = APP_DIR / "debug_screenshots"
+        self.profile_dir = PROFILE_DIR / platform
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
+        self.checkpoint = CollectionCheckpoint(platform, window, tz, config, platform_config)
+        self.browser_config = config.get("browser", {})
+        self.verification_poll_seconds = max(0.5, float(self.browser_config.get("verification_poll_seconds", 1.5)))
+        self.verification_confirm_checks = max(1, int(self.browser_config.get("verification_confirm_checks", 2)))
+        self.verification_confirm_interval_seconds = max(0.2, float(self.browser_config.get("verification_confirm_interval_seconds", 0.8)))
+        self.verification_min_evidence_score = max(1, int(self.browser_config.get("verification_min_evidence_score", 4)))
+        self.verification_wait_timeout_seconds = max(30.0, float(self.browser_config.get("verification_wait_timeout_seconds", 600)))
+        self.verification_stable_clear_seconds = max(1.0, float(self.browser_config.get("verification_stable_clear_seconds", 5)))
+        self.verification_post_clear_delay_seconds = max(0.0, float(self.browser_config.get("verification_post_clear_delay_seconds", 4)))
+        self._verification_active = False
+        self._verification_sequence = 0
 
-    def launch_context(self) -> BrowserContext:
-        self.profile_path.mkdir(parents=True, exist_ok=True)
-        browser_args = ["--disable-notifications"]
-        if self.is_background_offscreen:
-            # Keep a fully rendered, headed browser but place its window outside the
-            # visible desktop.  This is more compatible with Douyin than true headless.
+    def search_url(self, keyword: str) -> str:
+        encoded = urllib.parse.quote(keyword)
+        if self.platform == "douyin":
+            return f"https://www.douyin.com/search/{encoded}?type=video"
+        if self.platform == "kuaishou":
+            return f"https://www.kuaishou.com/search/video?searchKey={encoded}"
+        return f"https://www.tiktok.com/search/video?q={encoded}"
+
+    def launch_context(self, playwright: Playwright) -> BrowserContext:
+        args = ["--disable-blink-features=AutomationControlled", "--disable-notifications", "--no-first-run"]
+        if self.background:
             x = int(self.browser_config.get("background_window_x", -32000))
             y = int(self.browser_config.get("background_window_y", -32000))
-            browser_args.extend([f"--window-position={x},{y}", "--window-size=1440,1000"])
-        elif self.is_headless:
-            browser_args.append("--window-size=1440,1000")
+            args.extend([f"--window-position={x},{y}", "--window-size=1440,1000"])
         else:
-            browser_args.append("--start-maximized")
-        context = self.playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self.profile_path),
-            headless=self.is_headless,
-            slow_mo=int(self.browser_config.get("slow_mo_ms", 0)),
+            args.append("--start-maximized")
+        requested_headless = bool(self.browser_config.get("headless", False))
+        actual_headless = requested_headless and not self.visible and not self.background
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=str(self.profile_dir),
+            headless=actual_headless,
             locale=str(self.platform_config.get("locale", "zh-CN")),
             viewport={"width": 1440, "height": 1000},
-            args=browser_args,
+            slow_mo=int(self.browser_config.get("slow_mo_ms", 0)),
+            args=args,
         )
         context.set_default_timeout(int(self.browser_config.get("navigation_timeout_ms", 60000)))
-        context.set_default_navigation_timeout(int(self.browser_config.get("navigation_timeout_ms", 60000)))
+        context.on("response", self.on_response)
         return context
 
-    def _request_text(self, response: Response) -> str:
-        parts = [response.url]
+    def _safe_visible_count(self, page: Page, selector: str) -> int:
         try:
-            post_data = response.request.post_data or ""
-            if post_data:
-                parts.append(post_data)
+            locator = page.locator(selector)
+            count = min(locator.count(), 12)
+            visible = 0
+            for index in range(count):
+                try:
+                    element = locator.nth(index)
+                    if not element.is_visible(timeout=180):
+                        continue
+                    box = element.bounding_box(timeout=180)
+                    if box and box.get("width", 0) >= 24 and box.get("height", 0) >= 18:
+                        visible += 1
+                except Exception:
+                    continue
+            return visible
         except Exception:
-            pass
-        return urllib.parse.unquote_plus(" ".join(parts)).casefold()
+            return 0
 
-    def _is_search_response(self, response: Response) -> bool:
-        """Only accept real search endpoints while collecting a keyword.
+    def _visible_text_hits(self, page: Page, phrases: Iterable[str]) -> list[str]:
+        hits: list[str] = []
+        for phrase in phrases:
+            try:
+                locator = page.get_by_text(phrase, exact=False)
+                count = min(locator.count(), 5)
+                for index in range(count):
+                    element = locator.nth(index)
+                    try:
+                        if not element.is_visible(timeout=160):
+                            continue
+                        box = element.bounding_box(timeout=160)
+                        if box and box.get("width", 0) >= 30 and box.get("height", 0) >= 16:
+                            hits.append(phrase)
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return hits
 
-        The previous version accepted any URL containing feed/item/detail/api, which
-        accidentally imported recommendations and unrelated page data.
-        """
-        text = self._request_text(response)
-        if "search" not in text:
-            return False
-        blocked = ("search/sug", "search_sug", "suggest", "hot/search", "history")
-        return not any(token in text for token in blocked)
-
-    def _is_detail_response(self, response: Response) -> bool:
-        text = self._request_text(response)
-        if not self.active_video_id or self.active_video_id not in text:
-            return False
-        return any(token in text for token in ("detail", "aweme", "item"))
-
-    def response_handler(self, response: Response) -> None:
+    def _normal_content_visible(self, page: Page) -> bool:
         try:
-            resource_type = response.request.resource_type
-            if resource_type not in {"xhr", "fetch", "document"}:
-                return
-            if self.capture_mode == "search":
-                if not self._is_search_response(response):
-                    return
-                target_store = self.active_store
-            elif self.capture_mode == "detail":
-                if not self._is_detail_response(response):
-                    return
-                target_store = RecordStore(self.platform)
-            else:
-                return
+            url = (page.url or "").lower()
+        except Exception:
+            url = ""
+        selectors = [
+            'a[href*="/video/"]',
+            '[data-e2e*="search-card"]',
+            '[data-e2e*="search-video"]',
+            '[class*="search-result"] a[href*="/video/"]',
+            '[class*="video-card"]',
+        ]
+        if "/search/" in url or "search?" in url:
+            for selector in selectors:
+                if self._safe_visible_count(page, selector) >= 2:
+                    return True
+        if "/video/" in url and self._safe_visible_count(page, "video") >= 1:
+            return True
+        return False
 
+    def _verification_evidence(self, page: Page) -> tuple[int, list[str]]:
+        score = 0
+        reasons: list[str] = []
+        try:
+            url = (page.url or "").lower()
+        except Exception:
+            url = ""
+        if any(token in url for token in ("captcha", "verify", "verification", "security-check")):
+            score += 5
+            reasons.append("验证URL")
+
+        strong_selectors = [
+            'iframe[src*="captcha" i]',
+            'iframe[src*="verify" i]',
+            'iframe[src*="security" i]',
+            '[id*="captcha" i]',
+            '[class*="captcha" i]',
+            '[id*="verify" i][role="dialog"]',
+            '[class*="verify" i][role="dialog"]',
+            '[class*="captcha" i][role="dialog"]',
+            '[class*="slider" i][class*="verify" i]',
+            '[class*="puzzle" i][class*="verify" i]',
+            '[aria-modal="true"][class*="verify" i]',
+            '[aria-modal="true"][class*="captcha" i]',
+        ]
+        visible_strong = sum(self._safe_visible_count(page, selector) for selector in strong_selectors)
+        if visible_strong:
+            score += min(8, visible_strong * 4)
+            reasons.append(f"可见验证组件{visible_strong}")
+
+        strong_phrases = [
+            "拖动滑块完成拼图",
+            "请完成安全验证",
+            "请完成下方验证",
+            "点击图中",
+            "依次点击",
+            "请拖动滑块",
+            "完成拼图验证",
+            "请完成验证后继续",
+        ]
+        phrase_hits = self._visible_text_hits(page, strong_phrases)
+        if phrase_hits:
+            score += min(8, len(phrase_hits) * 4)
+            reasons.append("可见验证文案:" + "/".join(phrase_hits[:2]))
+
+        overlay_selectors = [
+            '[role="dialog"][aria-modal="true"]',
+            '[class*="modal-mask" i]',
+            '[class*="captcha-mask" i]',
+            '[class*="verify-mask" i]',
+        ]
+        overlay_count = sum(self._safe_visible_count(page, selector) for selector in overlay_selectors)
+        if overlay_count and (visible_strong or phrase_hits):
+            score += 2
+            reasons.append("可见遮罩")
+
+        if self._normal_content_visible(page) and not visible_strong and not phrase_hits:
+            return 0, []
+        return score, reasons
+
+    def _snapshot_verification(self, page: Page, phase: str) -> Optional[dict[str, Any]]:
+        score, reasons = self._verification_evidence(page)
+        if score < self.verification_min_evidence_score:
+            return None
+        return {"page": page, "score": score, "reasons": reasons, "phase": phase, "url": page.url}
+
+    def _detect_verification_once(self, phase: str) -> Optional[dict[str, Any]]:
+        if not self.context:
+            return None
+        for page in list(self.context.pages):
+            try:
+                if page.is_closed():
+                    continue
+                hit = self._snapshot_verification(page, phase)
+                if hit:
+                    return hit
+            except Exception:
+                continue
+        return None
+
+    def detect_verification(self, phase: str = "runtime") -> Optional[dict[str, Any]]:
+        first = self._detect_verification_once(phase)
+        if not first:
+            return None
+        for _ in range(self.verification_confirm_checks - 1):
+            time.sleep(self.verification_confirm_interval_seconds)
+            again = self._detect_verification_once(phase)
+            if not again:
+                return None
+            first = again
+        return first
+
+    def _save_verification_screenshot(self, hit: Mapping[str, Any]) -> Optional[Path]:
+        if not self.browser_config.get("save_debug_screenshots", True):
+            return None
+        page = hit.get("page")
+        if not isinstance(page, Page):
+            return None
+        self._verification_sequence += 1
+        path = self.debug_dir / f"{self.platform}_verification_{datetime.now():%Y%m%d_%H%M%S}_{self._verification_sequence}.png"
+        try:
+            page.screenshot(path=str(path), full_page=False)
+            return path
+        except Exception:
+            return None
+
+    def wait_for_verification_if_needed(self, phase: str = "runtime") -> None:
+        hit = self.detect_verification(phase)
+        if not hit:
+            return
+        screenshot = self._save_verification_screenshot(hit)
+        reason = ", ".join(hit.get("reasons") or ["可见验证组件"])
+        if not self.visible:
+            extra = f"；截图：{screenshot}" if screenshot else ""
+            raise VerificationRequiredError(f"[{self.label}] 检测到可见验证码/安全验证（{reason}，阶段={phase}）{extra}。已保存断点，请运行 run_visible.bat。")
+
+        if not self._verification_active:
+            self._verification_active = True
+            logging.warning("[%s] 检测到可见验证码/安全验证（%s，阶段=%s）。程序已暂停。", self.label, reason, phase)
+            print("\n" + "=" * 68)
+            print(f"[{self.label}] 检测到真正可见的验证码或安全验证，程序已暂停。")
+            print("请在浏览器中完成验证；无需回到黑框按回车。")
+            print("验证消失并稳定后，程序会自动继续当前任务。")
+            if screenshot:
+                print(f"检测截图：{screenshot}")
+            print("=" * 68 + "\n")
+
+        started = time.monotonic()
+        clear_since: Optional[float] = None
+        last_log = 0.0
+        while True:
+            current = self._detect_verification_once(phase)
+            now_mono = time.monotonic()
+            if current:
+                clear_since = None
+                if now_mono - last_log >= 30:
+                    remaining = max(0, int(self.verification_wait_timeout_seconds - (now_mono - started)))
+                    logging.info("[%s] 仍在等待人工完成验证，剩余约 %d 秒。", self.label, remaining)
+                    last_log = now_mono
+            else:
+                if clear_since is None:
+                    clear_since = now_mono
+                    logging.info("[%s] 验证组件已消失，等待稳定 %.0f 秒。", self.label, self.verification_stable_clear_seconds)
+                elif now_mono - clear_since >= self.verification_stable_clear_seconds:
+                    logging.info("[%s] 验证已完成，%.1f 秒后继续当前任务。", self.label, self.verification_post_clear_delay_seconds)
+                    if self.verification_post_clear_delay_seconds:
+                        self.monitored_sleep(self.verification_post_clear_delay_seconds, phase=f"{phase}_post_clear", allow_verification=False)
+                    self._verification_active = False
+                    return
+            if now_mono - started >= self.verification_wait_timeout_seconds:
+                self._verification_active = False
+                raise VerificationRequiredError(f"[{self.label}] 等待人工验证超过 {int(self.verification_wait_timeout_seconds)} 秒。已保存断点，请稍后重新运行 run_visible.bat。")
+            time.sleep(self.verification_poll_seconds)
+
+    def monitored_sleep(self, seconds: float, phase: str = "wait", *, allow_verification: bool = True) -> None:
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(self.verification_poll_seconds, remaining))
+            if allow_verification:
+                self.wait_for_verification_if_needed(phase)
+
+    def wait_between_keywords(self, keyword_index: int, total_keywords: int) -> None:
+        if keyword_index >= total_keywords:
+            return
+        minimum = max(0.0, float(self.browser_config.get("keyword_delay_min_seconds", 8)))
+        maximum = max(minimum, float(self.browser_config.get("keyword_delay_max_seconds", 15)))
+        delay = random.uniform(minimum, maximum)
+        logging.info("[%s] 下一个搜索词前等待 %.1f 秒，并持续检查验证码。", self.label, delay)
+        self.monitored_sleep(delay, phase=f"keyword_gap_{keyword_index}")
+
+    def on_response(self, response: Response) -> None:
+        try:
+            url = response.url
             content_type = (response.headers.get("content-type") or "").lower()
-            self.response_seen += 1
-            content_length = parse_count(response.headers.get("content-length", 0))
-            if content_length > 15_000_000:
+            if "json" not in content_type and not any(token in url.lower() for token in ("api", "graphql", "aweme", "item", "feed", "search")):
+                return
+            is_search = response_is_search_candidate(self.platform, url, bool(self.current_keyword))
+            is_detail = response_is_detail_candidate(self.platform, url)
+            if not is_search and not is_detail:
                 return
             try:
                 payload = response.json()
             except Exception:
-                if "json" not in content_type:
-                    return
-                body = response.body()
-                if len(body) > 15_000_000:
-                    return
-                raw = body.decode("utf-8", errors="ignore").strip()
-                if not raw or raw[0] not in "[{":
-                    return
-                payload = json.loads(raw)
-
-            added = parse_payload(
-                self.platform,
-                payload,
-                self.current_keyword,
-                f"network:{short_url(response.url)}",
-                target_store,
-            )
-            if self.capture_mode == "search":
-                self.active_search_response_count += 1
-                if added:
-                    self.response_parsed += 1
-            else:
-                for candidate in target_store.values():
-                    if candidate.video_id == self.active_video_id:
-                        self.store.add(candidate)
-                        self.response_parsed += 1
-        except Exception as exc:
-            self.response_errors += 1
-            logging.debug("[%s] response parse failed: %s", self.platform, exc)
-
-    def check_verification(self, page: Page, stage: str) -> None:
-        try:
-            title = page.title()
+                return
+            if is_search:
+                parsed = parse_json_records(self.platform, payload, self.current_keyword, "search_api")
+                if parsed:
+                    self.response_records.extend(parsed)
+                self.search_response_count += 1
+            if is_detail:
+                parsed = parse_json_records(self.platform, payload, self.current_keyword, "detail_api")
+                if parsed:
+                    self.response_records.extend(parsed)
+                self.detail_response_count += 1
         except Exception:
-            title = ""
+            logging.debug("响应解析失败：%s", traceback.format_exc())
+
+    def extract_dom_video_urls(self, page: Page) -> list[str]:
+        patterns = {"douyin": "/video/", "kuaishou": "/short-video/", "tiktok": "/video/"}
+        token = patterns[self.platform]
         try:
-            body = page.locator("body").inner_text(timeout=5000)[:5000]
+            urls = page.locator(f'a[href*="{token}"]').evaluate_all("elements => elements.map(e => e.href)")
         except Exception:
-            body = ""
-        text = f"{title}\n{body}".casefold()
-        markers = ["验证码", "安全验证", "完成验证", "verify you are human", "captcha", "security verification"]
-        if any(marker.casefold() in text for marker in markers):
-            self.captcha_count += 1
-            self.save_screenshot(page, f"verification_{stage}_{self.captcha_count}")
-            if self.is_unattended:
-                raise VerificationRequiredError(
-                    f"[{PLATFORM_LABELS[self.platform]}] 检测到验证码或安全验证。"
-                    "后台模式已停止；请运行 run_visible.bat 完成验证，或重新运行 login_once.bat。"
-                )
-            print(
-                f"\n[{PLATFORM_LABELS[self.platform]}] 检测到验证码或安全验证。"
-                "请在已打开的浏览器中手动完成，完成后回到此窗口按回车继续。"
-            )
-            input()
+            return []
+        return list(dict.fromkeys(str(url) for url in urls if token in str(url)))
 
-    def save_screenshot(self, page: Page, name: str) -> None:
-        if not self.browser_config.get("save_debug_screenshots", True):
-            return
-        try:
-            safe = re.sub(r"[^\w\-]+", "_", name)[:80]
-            page.screenshot(path=str(self.debug_dir / f"{safe}.png"), full_page=False)
-        except Exception:
-            pass
-
-    def parse_embedded_json(self, page: Page, source_prefix: str, target_store: Optional[RecordStore] = None) -> None:
-        target_store = target_store or self.active_store
-        selectors = [
-            "script[type='application/json']",
-            "script#__UNIVERSAL_DATA_FOR_REHYDRATION__",
-            "script#SIGI_STATE",
-            "script#RENDER_DATA",
-            "script#__NEXT_DATA__",
-        ]
-        for selector in selectors:
-            try:
-                locator = page.locator(selector)
-                count = min(locator.count(), 30)
-                for i in range(count):
-                    raw = (locator.nth(i).text_content(timeout=3000) or "").strip()
-                    if not raw:
-                        continue
-                    variants = [raw]
-                    if "%7B" in raw or "%22" in raw:
-                        variants.append(urllib.parse.unquote(raw))
-                    for candidate in variants:
-                        candidate = candidate.strip()
-                        if not candidate or candidate[0] not in "[{":
-                            continue
-                        try:
-                            payload = json.loads(candidate)
-                        except json.JSONDecodeError:
-                            continue
-                        parse_payload(
-                            self.platform, payload, self.current_keyword,
-                            f"{source_prefix}:{selector}", target_store
-                        )
-                        break
-            except Exception as exc:
-                logging.debug("[%s] embedded JSON failed %s: %s", self.platform, selector, exc)
-
-    def parse_dom_links(self, page: Page, source: str, target_store: Optional[RecordStore] = None) -> None:
-        """Extract only visible video cards in the central search-results area.
-
-        This deliberately excludes hidden anchors, navigation links and most right-hand
-        recommendations. It is a fallback; the real search XHR remains the preferred source.
-        """
-        target_store = target_store or self.active_store
-        try:
-            rows = page.evaluate(
-                """
-                () => {
-                  const vw = window.innerWidth || 1440;
-                  const vh = window.innerHeight || 1000;
-                  const links = Array.from(document.querySelectorAll(
-                    'a[href*="/video/"], a[href*="modal_id="]'
-                  ));
-                  return links.map(a => {
-                    const rect = a.getBoundingClientRect();
-                    const style = getComputedStyle(a);
-                    if (!rect.width || !rect.height || style.display === 'none' || style.visibility === 'hidden') return null;
-                    const cx = rect.left + rect.width / 2;
-                    if (cx < 110 || cx > vw * 0.88 || rect.bottom < -200 || rect.top > vh + 6000) return null;
-                    let node = a;
-                    let text = '';
-                    let img = '';
-                    for (let i = 0; i < 7 && node; i++, node = node.parentElement) {
-                      const t = (node.innerText || '').trim();
-                      const media = node.querySelector && (node.querySelector('img') || node.querySelector('video'));
-                      if (!img && media) img = media.poster || media.src || '';
-                      if (!text && t.length >= 4 && t.length <= 1200) text = t;
-                      if (text && img) break;
-                    }
-                    return {href: a.href || '', text, img, x: rect.left, y: rect.top};
-                  }).filter(Boolean);
-                }
-                """
-            )
-        except Exception as exc:
-            logging.debug("[%s] DOM link extraction failed: %s", self.platform, exc)
-            return
-        if not isinstance(rows, list):
-            return
-        for row in rows:
-            if not isinstance(row, Mapping):
-                continue
-            url = canonicalize_url(normalize_text(row.get("href")))
-            if not is_platform_video_url(self.platform, url):
-                continue
-            video_id = extract_video_id_from_url(self.platform, url)
+    def records_from_dom_urls(self, urls: Iterable[str], keyword: str) -> list[VideoRecord]:
+        records: list[VideoRecord] = []
+        for url in urls:
+            match = re.search(r"/(?:video|short-video)/(\d+)", url)
+            video_id = match.group(1) if match else canonicalize_url(url)
             if not video_id:
                 continue
-            card_text = normalize_text(row.get("text"))
-            record = VideoRecord(
-                platform=self.platform,
-                video_id=video_id,
-                url=url,
-                title=card_text[:500],
-                thumbnail=normalize_text(row.get("img")),
-                source_keyword=self.current_keyword,
-                data_sources={source},
-                data_quality_notes=["搜索页DOM兜底，互动数据由详情页补全"],
-            )
-            target_store.add(record)
+            records.append(VideoRecord(platform=self.platform, video_id=video_id, url=canonicalize_url(url), source_keyword=keyword, data_sources={"search_dom"}))
+        return records
 
-    def _find_search_input(self, page: Page):
-        selectors = [
-            "input[placeholder*='搜索']",
-            "input[type='search']",
-            "input[data-e2e*='search']",
-            "input",
-        ]
-        for selector in selectors:
-            try:
-                locator = page.locator(selector)
-                for i in range(min(locator.count(), 12)):
-                    item = locator.nth(i)
-                    if item.is_visible():
-                        return item
-            except Exception:
-                continue
-        return None
-
-    def submit_search_via_ui(self, page: Page, keyword: str) -> bool:
-        search_input = self._find_search_input(page)
-        if search_input is None:
-            return False
+    def perform_search(self, keyword: str, retry: bool = False) -> tuple[list[VideoRecord], int]:
+        assert self.page is not None
+        self.current_keyword = keyword
+        self.response_records = []
+        before_response_count = self.search_response_count
+        self.wait_for_verification_if_needed(f"search_{keyword}_before")
+        url = self.search_url(keyword)
         try:
-            search_input.click(timeout=5000)
-            search_input.fill(keyword, timeout=5000)
-            search_input.press("Enter")
-            page.wait_for_timeout(3500)
+            self.page.goto(url, wait_until="domcontentloaded", timeout=int(self.browser_config.get("navigation_timeout_ms", 60000)))
+        except PlaywrightTimeoutError:
+            logging.warning("[%s] 搜索页加载超时：%s", self.label, keyword)
+        self.wait_for_verification_if_needed(f"search_{keyword}_after_goto")
+        self.monitored_sleep(float(self.browser_config.get("request_delay_seconds", 0.7)) + 1.2, phase=f"search_{keyword}_initial_wait")
+        self.wait_for_verification_if_needed(f"search_{keyword}_before_scroll")
+        scrolls = int(self.browser_config.get("scrolls_per_keyword", 8))
+        pause = float(self.browser_config.get("scroll_pause_seconds", 1.5))
+        for scroll_index in range(scrolls):
+            self.wait_for_verification_if_needed(f"search_{keyword}_scroll_{scroll_index}_before")
             try:
-                page.get_by_text("视频", exact=True).first.click(timeout=2500)
-                page.wait_for_timeout(1800)
+                self.page.mouse.wheel(0, random.randint(850, 1450))
             except Exception:
                 pass
-            return True
-        except Exception as exc:
-            logging.debug("[%s] UI search submit failed: %s", self.platform, exc)
-            return False
+            self.monitored_sleep(pause, phase=f"search_{keyword}_scroll_{scroll_index}")
+        self.wait_for_verification_if_needed(f"search_{keyword}_after_scroll")
+        records = list(self.response_records)
+        add_dom = self.records_from_dom_urls(self.extract_dom_video_urls(self.page), keyword)
+        records.extend(add_dom)
+        unique: dict[str, VideoRecord] = {}
+        add_records(unique, records)
+        response_delta = self.search_response_count - before_response_count
+        return list(unique.values()), response_delta
 
-    def _collect_keyword_once(self, page: Page, keyword: str, index: int, use_ui: bool) -> RecordStore:
-        keyword_store = RecordStore(self.platform)
-        self.active_store = keyword_store
-        self.capture_mode = "search"
-        self.active_search_response_count = 0
-        if use_ui:
-            if not self.submit_search_via_ui(page, keyword):
-                page.goto(search_url(self.platform, keyword), wait_until="domcontentloaded")
-        else:
-            page.goto(search_url(self.platform, keyword), wait_until="domcontentloaded")
-        page.wait_for_timeout(3800)
-        self.check_verification(page, f"search_{index}_{'ui' if use_ui else 'url'}")
+    def enrich_record(self, record: VideoRecord) -> None:
+        assert self.page is not None
+        if not record.url:
+            return
+        self.wait_for_verification_if_needed(f"detail_{record.video_id}_before")
+        self.current_keyword = record.source_keyword
+        self.response_records = []
         try:
-            page.wait_for_function(
-                "document.querySelectorAll('a[href*=\"/video/\"],a[href*=\"modal_id=\"]').length > 0",
-                timeout=12000,
-            )
+            self.page.goto(record.url, wait_until="domcontentloaded", timeout=int(self.browser_config.get("navigation_timeout_ms", 60000)))
+        except PlaywrightTimeoutError:
+            record.data_quality_notes.append("详情页加载超时")
+        self.wait_for_verification_if_needed(f"detail_{record.video_id}_after_goto")
+        self.monitored_sleep(float(self.browser_config.get("detail_wait_seconds", 1.8)), phase=f"detail_{record.video_id}_wait")
+        self.wait_for_verification_if_needed(f"detail_{record.video_id}_after_wait")
+        for parsed in list(self.response_records):
+            if parsed.video_id == record.video_id or len(self.response_records) == 1:
+                merge_record(record, parsed)
+        if self.platform == "douyin":
+            self.enrich_douyin_dom(record)
+        self.wait_for_verification_if_needed(f"detail_{record.video_id}_after_dom")
+
+    def enrich_douyin_dom(self, record: VideoRecord) -> None:
+        assert self.page is not None
+        try:
+            body_text = self.page.locator("body").inner_text(timeout=5000)
+        except Exception:
+            body_text = ""
+        if body_text:
+            patterns = {
+                "likes": [r"(?:点赞|赞)\s*([\d.,万亿kKmM]+)", r"([\d.,万亿kKmM]+)\s*赞"],
+                "comments": [r"评论\s*([\d.,万亿kKmM]+)"],
+                "favorites": [r"收藏\s*([\d.,万亿kKmM]+)"],
+                "shares": [r"分享\s*([\d.,万亿kKmM]+)"],
+            }
+            for attr, attr_patterns in patterns.items():
+                for pattern in attr_patterns:
+                    match = re.search(pattern, body_text, flags=re.I)
+                    if match:
+                        setattr(record, attr, max(getattr(record, attr), parse_count(match.group(1))))
+                        record.data_sources.add("detail_dom")
+                        break
+            date_match = re.search(r"发布时间[:：]?\s*(20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:日)?(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)", body_text)
+            if date_match and not record.create_time:
+                raw_date = date_match.group(1).replace("年", "-").replace("月", "-").replace("日", "").replace("/", ".")
+                record.create_time = parse_datetime(raw_date.replace(".", "-"))
+                if record.create_time:
+                    record.create_time = record.create_time.replace(tzinfo=self.tz).astimezone(timezone.utc)
+        try:
+            title = self.page.locator("h1").first.inner_text(timeout=1500)
+            if title:
+                record.title = max(record.title, normalize_text(title), key=len)
         except Exception:
             pass
-        scrolls = int(self.browser_config.get("scrolls_per_keyword", 12))
-        scroll_pause_ms = int(float(self.browser_config.get("scroll_pause_seconds", 1.3)) * 1000)
-        for step in range(scrolls):
-            page.evaluate("window.scrollBy(0, Math.max(1800, window.innerHeight * 1.8))")
-            page.wait_for_timeout(scroll_pause_ms)
-            if step in {1, 3, 6, scrolls - 1}:
-                self.parse_dom_links(page, f"dom:search:{keyword}", keyword_store)
-        self.parse_embedded_json(page, f"search:{keyword}", keyword_store)
-        self.parse_dom_links(page, f"dom:search:{keyword}", keyword_store)
-        self.capture_mode = "idle"
-        return keyword_store
-
-    @staticmethod
-    def _id_set(store: RecordStore) -> set[str]:
-        return {r.video_id for r in store.values() if r.video_id}
-
-    @staticmethod
-    def _jaccard(a: set[str], b: set[str]) -> float:
-        if not a or not b:
-            return 0.0
-        return len(a & b) / len(a | b)
-
-    def parse_meta(self, page: Page, record: VideoRecord) -> None:
-        def attr(selector: str, name: str) -> str:
-            try:
-                return normalize_text(page.locator(selector).first.get_attribute(name, timeout=2500))
-            except Exception:
-                return ""
-
-        title = attr("meta[property='og:title']", "content") or attr("meta[name='description']", "content")
-        image = attr("meta[property='og:image']", "content")
-        canonical = attr("link[rel='canonical']", "href")
-        merged = VideoRecord(
-            platform=self.platform,
-            video_id=record.video_id or extract_video_id_from_url(self.platform, canonical),
-            url=canonicalize_url(canonical or record.url),
-            title=title,
-            thumbnail=image,
-            source_keyword=record.source_keyword,
-            data_sources={"detail:meta"},
-        )
-        self.store.add(merged)
 
     def collect(self) -> tuple[list[VideoRecord], dict[str, Any]]:
-        keywords = [normalize_text(k) for k in self.platform_config.get("keywords", []) if normalize_text(k)]
+        keywords = list(self.platform_config.get("keywords", []))
+        if not keywords:
+            return [], {"warning": "未配置关键词"}
         max_candidates = int(self.browser_config.get("max_candidates_per_platform", 1200))
-        search_delay = float(self.browser_config.get("request_delay_seconds", 0.8))
-        min_keyword_results = int(self.browser_config.get("minimum_keyword_result_count", 5))
-        repeated_threshold = float(self.browser_config.get("repeated_result_jaccard_threshold", 0.88))
-        empty_abort_after = max(1, int(self.browser_config.get("headless_abort_after_empty_keywords", 4)))
-
+        max_details = int(self.browser_config.get("max_detail_visits_per_platform", 250))
+        empty_abort_after = int(self.browser_config.get("headless_abort_after_empty_keywords", 4))
+        empty_min_candidates = int(self.browser_config.get("headless_min_candidates_before_empty_abort", 8))
         checkpoint_batch_size = max(1, int(self.browser_config.get("checkpoint_batch_size", 20)))
-        detail_delay_min = max(0.0, float(self.browser_config.get("detail_delay_min_seconds", 2.2)))
-        detail_delay_max = max(detail_delay_min, float(self.browser_config.get("detail_delay_max_seconds", 4.8)))
-        batch_rest_min = max(0.0, float(self.browser_config.get("batch_rest_min_seconds", 18)))
-        batch_rest_max = max(batch_rest_min, float(self.browser_config.get("batch_rest_max_seconds", 40)))
-        max_detail_attempts = max(1, int(self.browser_config.get("max_detail_attempts", 2)))
-        failure_backoff_base = max(0.5, float(self.browser_config.get("failure_backoff_base_seconds", 3)))
-        failure_backoff_max = max(failure_backoff_base, float(self.browser_config.get("failure_backoff_max_seconds", 45)))
-        failure_cooldown_after = max(1, int(self.browser_config.get("consecutive_failure_cooldown_after", 4)))
-        failure_abort_after = max(failure_cooldown_after + 1, int(self.browser_config.get("consecutive_failure_abort_after", 8)))
-        cooldown_min = max(0.0, float(self.browser_config.get("cooldown_min_seconds", 45)))
-        cooldown_max = max(cooldown_min, float(self.browser_config.get("cooldown_max_seconds", 90)))
-
-        window, tz = compute_window(self.config)
-        checkpoint = CollectionCheckpoint(self.platform, window, tz, self.config, self.platform_config)
-        state = checkpoint.load()
-        phase = "search"
+        max_attempts = max(1, int(self.browser_config.get("max_detail_attempts", 2)))
+        consecutive_cooldown_after = max(1, int(self.browser_config.get("consecutive_failure_cooldown_after", 4)))
+        consecutive_abort_after = max(consecutive_cooldown_after, int(self.browser_config.get("consecutive_failure_abort_after", 8)))
+        relevant_store: dict[str, VideoRecord] = {}
+        state = self.checkpoint.load()
         next_keyword_index = 0
+        last_keyword_ids: set[str] = set()
         detail_keys: list[str] = []
         completed_detail_keys: set[str] = set()
         failed_attempts: dict[str, int] = {}
         processed_detail_count = 0
-        empty_streak = 0
-
+        phase = "search"
         if state:
             for raw in state.get("records", []):
                 try:
-                    self.store.add(video_record_from_dict(raw))
-                except Exception as exc:
-                    logging.debug("[%s] 忽略无法恢复的断点记录：%s", self.platform, exc)
-            phase = str(state.get("phase", "search"))
-            next_keyword_index = max(0, int(state.get("next_keyword_index", 0)))
-            self.last_keyword_ids = set(str(x) for x in state.get("last_keyword_ids", []))
-            detail_keys = [str(x) for x in state.get("detail_keys", [])]
-            completed_detail_keys = set(str(x) for x in state.get("completed_detail_keys", []))
-            failed_attempts = {str(k): int(v) for k, v in dict(state.get("failed_attempts", {})).items()}
-            processed_detail_count = int(state.get("processed_detail_count", len(completed_detail_keys)))
-            logging.info(
-                "[%s] 已恢复断点：阶段=%s，搜索进度=%d/%d，详情已处理=%d，记录=%d",
-                PLATFORM_LABELS[self.platform], phase, next_keyword_index, len(keywords),
-                processed_detail_count, len(self.store)
-            )
+                    record = video_record_from_dict(raw)
+                    relevant_store[record.key()] = record
+                except Exception:
+                    continue
+            phase = str(state.get("phase") or "search")
+            next_keyword_index = int(state.get("next_keyword_index", 0))
+            last_keyword_ids = set(state.get("last_keyword_ids", []))
+            detail_keys = list(state.get("detail_keys", []))
+            completed_detail_keys = set(state.get("completed_detail_keys", []))
+            failed_attempts = {str(k): int(v) for k, v in (state.get("failed_attempts") or {}).items()}
+            processed_detail_count = int(state.get("processed_detail_count", 0))
+            logging.info("[%s] 已恢复断点：阶段=%s，搜索进度=%d/%d，详情已处理=%d，记录=%d", self.label, phase, next_keyword_index, len(keywords), processed_detail_count, len(relevant_store))
 
-        logging.info(
-            "[%s] 启动采集，关键词 %d 个，模式：%s（断点续跑与风控保护版）",
-            PLATFORM_LABELS[self.platform], len(keywords),
-            "后台兼容（屏幕外正常浏览器）" if self.is_background_offscreen else ("真正无头" if self.is_headless else "可见")
-        )
-        context = self.launch_context()
-        page = context.pages[0] if context.pages else context.new_page()
-        page.on("response", self.response_handler)
-
-        def save_progress(note: str = "") -> None:
-            checkpoint.save(
-                self.store.values(),
-                phase=phase,
+        def save_checkpoint(current_phase: str, note: str = "") -> None:
+            self.checkpoint.save(
+                relevant_store.values(),
+                phase=current_phase,
                 next_keyword_index=next_keyword_index,
-                last_keyword_ids=self.last_keyword_ids,
+                last_keyword_ids=last_keyword_ids,
                 detail_keys=detail_keys,
                 completed_detail_keys=completed_detail_keys,
                 failed_attempts=failed_attempts,
@@ -1355,1088 +1284,446 @@ class PlatformCollector:
                 note=note,
             )
 
-        try:
-            if phase == "search":
-                for zero_index in range(next_keyword_index, len(keywords)):
-                    index = zero_index + 1
-                    keyword = keywords[zero_index]
-                    if len(self.store) >= max_candidates:
-                        logging.info("[%s] 已达到候选上限 %d", PLATFORM_LABELS[self.platform], max_candidates)
-                        next_keyword_index = len(keywords)
-                        break
-                    self.current_keyword = keyword
-                    logging.info("[%s] %d/%d 搜索：%s", PLATFORM_LABELS[self.platform], index, len(keywords), keyword)
-                    keyword_finished = False
-                    try:
-                        keyword_store = self._collect_keyword_once(page, keyword, index, use_ui=False)
-                        current_ids = self._id_set(keyword_store)
-                        repeated = self._jaccard(current_ids, self.last_keyword_ids)
-                        if len(keyword_store) < min_keyword_results or repeated >= repeated_threshold:
-                            logging.warning(
-                                "[%s] 关键词“%s”首轮仅 %d 条或与上一词重复 %.0f%%，改用搜索框重试",
-                                PLATFORM_LABELS[self.platform], keyword, len(keyword_store), repeated * 100
-                            )
-                            self.save_screenshot(page, f"retry_keyword_{index}")
-                            keyword_store = self._collect_keyword_once(page, keyword, index, use_ui=True)
-                            current_ids = self._id_set(keyword_store)
-                            repeated = self._jaccard(current_ids, self.last_keyword_ids)
-
-                        before_count = len(self.store)
-                        for record in keyword_store.values():
-                            self.store.add(record)
-                        added_count = len(self.store) - before_count
-                        logging.info(
-                            "[%s] 本词抓到 %d 条，搜索响应 %d 个，全局去重 %d，本词新增 %d，和上一词重复 %.0f%%",
-                            PLATFORM_LABELS[self.platform], len(keyword_store), self.active_search_response_count,
-                            len(self.store), added_count, repeated * 100
-                        )
-                        if current_ids:
-                            self.last_keyword_ids = current_ids
-                        if added_count <= 0 or repeated >= repeated_threshold:
+        empty_streak = 0
+        repeated_warning_count = 0
+        diagnostics: dict[str, Any] = {"keyword_stats": [], "checkpoint": str(self.checkpoint.path), "resumed": bool(state)}
+        with sync_playwright() as playwright:
+            self.context = self.launch_context(playwright)
+            self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+            try:
+                self.wait_for_verification_if_needed("startup")
+                if phase == "search":
+                    for index in range(next_keyword_index, len(keywords)):
+                        keyword = keywords[index]
+                        logging.info("[%s] %d/%d 搜索：%s", self.label, index + 1, len(keywords), keyword)
+                        self.wait_for_verification_if_needed(f"keyword_{index}_before")
+                        records, response_count = self.perform_search(keyword)
+                        current_ids = {record.video_id or record.key() for record in records}
+                        overlap = len(last_keyword_ids & current_ids) / max(1, len(last_keyword_ids | current_ids)) if last_keyword_ids else 0.0
+                        threshold = float(self.browser_config.get("repeated_result_jaccard_threshold", 0.88))
+                        if last_keyword_ids and overlap >= threshold:
+                            logging.warning("[%s] %s 与上一词结果重复 %.0f%%，改用搜索框重试。", self.label, keyword, overlap * 100)
+                            try:
+                                search_box = self.page.locator('input[placeholder*="搜索"], input[type="search"]').first
+                                search_box.fill(keyword)
+                                search_box.press("Enter")
+                                self.wait_for_verification_if_needed(f"keyword_{index}_searchbox_after_enter")
+                                self.monitored_sleep(3.0, phase=f"keyword_{index}_searchbox_wait")
+                                records, response_count = self.perform_search(keyword, retry=True)
+                                current_ids = {record.video_id or record.key() for record in records}
+                                overlap = len(last_keyword_ids & current_ids) / max(1, len(last_keyword_ids | current_ids)) if last_keyword_ids else 0.0
+                            except Exception:
+                                logging.debug("搜索框重试失败：%s", traceback.format_exc())
+                        before = len(relevant_store)
+                        add_records(relevant_store, records)
+                        added = len(relevant_store) - before
+                        last_keyword_ids = current_ids
+                        next_keyword_index = index + 1
+                        diagnostics["keyword_stats"].append({"keyword": keyword, "records": len(records), "responses": response_count, "added": added, "overlap_previous": round(overlap, 4)})
+                        logging.info("[%s] 本词抓到 %d 条，搜索响应 %d 个，全局去重 %d，本词新增 %d，和上一词重复 %.0f%%", self.label, len(records), response_count, len(relevant_store), added, overlap * 100)
+                        if added == 0:
                             empty_streak += 1
-                            self.save_screenshot(page, f"stalled_search_{index}_{empty_streak}")
                         else:
                             empty_streak = 0
-                        if self.is_unattended and empty_streak >= empty_abort_after:
-                            raise EmptyDataError(
-                                f"[{PLATFORM_LABELS[self.platform]}] 连续 {empty_streak} 个关键词没有产生新的搜索结果，"
-                                f"当前全局候选 {len(self.store)} 条。已保存搜索断点；请运行 run_visible.bat。"
-                            )
-                        keyword_finished = True
-                    except CollectorNeedsAttention:
-                        next_keyword_index = zero_index
-                        save_progress(f"搜索关键词 {index}/{len(keywords)} 遇到验证，未跳过本关键词")
-                        raise
-                    except PlaywrightTimeoutError:
-                        logging.warning("[%s] 搜索页面超时：%s", PLATFORM_LABELS[self.platform], keyword)
-                        self.save_screenshot(page, f"timeout_search_{index}")
-                        keyword_finished = True
-                    except Exception as exc:
-                        logging.warning("[%s] 搜索失败 %s：%s", PLATFORM_LABELS[self.platform], keyword, exc)
-                        self.save_screenshot(page, f"error_search_{index}")
-                        keyword_finished = True
-                    finally:
-                        if keyword_finished:
-                            next_keyword_index = index
-                            save_progress(f"搜索关键词 {index}/{len(keywords)} 后保存")
-                    time.sleep(search_delay + random.uniform(0.15, 0.8))
+                        if overlap >= threshold:
+                            repeated_warning_count += 1
+                        save_checkpoint("search", note=f"完成关键词 {keyword}")
+                        self.wait_for_verification_if_needed(f"keyword_{index}_after_save")
+                        if empty_streak >= empty_abort_after and len(relevant_store) < empty_min_candidates:
+                            raise EmptyDataError(f"[{self.label}] 连续 {empty_streak} 个关键词没有产生新的搜索结果，当前全局候选 {len(relevant_store)} 条。已保存搜索断点；请运行 run_visible.bat。")
+                        if len(relevant_store) >= max_candidates:
+                            logging.info("[%s] 已达到候选上限 %d", self.label, max_candidates)
+                            break
+                        self.wait_between_keywords(index + 1, len(keywords))
+                    phase = "detail"
+                    next_keyword_index = len(keywords)
 
-                records = self.store.values()
-                filters = self.config.get("filters", {})
-                detail_pool: list[VideoRecord] = []
-                skipped_by_text = 0
-                for record in records:
-                    score, level, female, solo, sexy, reason = evaluate_target_match(record, filters)
-                    record.target_match_score = score
-                    record.match_level = level
-                    record.female_text_signal = female
-                    record.solo_text_signal = solo
-                    record.sexy_style_signal = sexy
-                    record.exclusion_reason = reason
-                    if reason:
-                        record.data_quality_notes.append(f"文本初筛排除：{reason}")
-                        skipped_by_text += 1
-                        continue
-                    detail_pool.append(record)
-                detail_pool.sort(
-                    key=lambda r: (
-                        -r.target_match_score,
-                        0 if r.create_time is None else 1,
-                        -(r.likes + r.comments * 3 + r.shares * 4 + r.favorites * 3),
-                    )
-                )
-                max_details = min(int(self.browser_config.get("max_detail_visits_per_platform", 360)), len(detail_pool))
-                detail_keys = [record.key() for record in detail_pool[:max_details]]
-                phase = "detail"
-                save_progress("搜索完成，已冻结详情补全顺序")
-                logging.info(
-                    "[%s] 搜索候选 %d 条；文字初筛可补全 %d 条，排除 %d 条；本轮详情上限 %d",
-                    PLATFORM_LABELS[self.platform], len(records), len(detail_pool), skipped_by_text, max_details
-                )
-
-            if phase == "complete":
-                logging.info("[%s] 本统计周已经补全完成，直接使用断点数据生成报告。", PLATFORM_LABELS[self.platform])
-            else:
-                records_by_key = {record.key(): record for record in self.store.values()}
-                # Old/partial checkpoint safety: rebuild the order when it is missing.
+                prefiltered = [record for record in relevant_store.values() if prefilter_record(record, self.config)]
+                diagnostics["candidate_count"] = len(relevant_store)
+                diagnostics["prefilter_count"] = len(prefiltered)
+                diagnostics["excluded_by_text"] = len(relevant_store) - len(prefiltered)
                 if not detail_keys:
-                    filters = self.config.get("filters", {})
-                    rebuilt: list[VideoRecord] = []
-                    for record in self.store.values():
-                        score, level, female, solo, sexy, reason = evaluate_target_match(record, filters)
-                        record.target_match_score = score
-                        record.match_level = level
-                        record.female_text_signal = female
-                        record.solo_text_signal = solo
-                        record.sexy_style_signal = sexy
-                        record.exclusion_reason = reason
-                        if not reason:
-                            rebuilt.append(record)
-                    rebuilt.sort(key=lambda r: (-r.target_match_score, -(r.likes + r.comments * 3 + r.shares * 4 + r.favorites * 3)))
-                    detail_keys = [r.key() for r in rebuilt[:int(self.browser_config.get("max_detail_visits_per_platform", 360))]]
-                    save_progress("重建详情补全顺序")
-
-                total_details = len(detail_keys)
-                remaining = sum(1 for key in detail_keys if key not in completed_detail_keys and failed_attempts.get(key, 0) < max_detail_attempts)
-                logging.info(
-                    "[%s] 开始/继续详情补全：总计 %d，已完成 %d，本次待处理 %d；每 %d 条原子保存一次",
-                    PLATFORM_LABELS[self.platform], total_details, len(completed_detail_keys), remaining, checkpoint_batch_size
-                )
-                detail_wait_ms = int(float(self.browser_config.get("detail_wait_seconds", 1.5)) * 1000)
-                since_checkpoint = 0
+                    prefiltered.sort(key=lambda record: (record.likes + record.shares * 4 + record.favorites * 3 + record.comments * 2, record.target_match_score), reverse=True)
+                    detail_keys = [record.key() for record in prefiltered[:max_details]]
+                save_checkpoint("detail", note="详情队列已建立")
+                logging.info("[%s] 搜索候选 %d 条，文字初筛可补全 %d 条，排除 %d 条；本轮详情上限 %d", self.label, len(relevant_store), len(prefiltered), len(relevant_store) - len(prefiltered), len(detail_keys))
+                pending_keys = [key for key in detail_keys if key not in completed_detail_keys]
+                logging.info("[%s] 开始/继续详情补全：总计 %d，已完成 %d，本次待处理 %d；每 %d 条原子保存一次", self.label, len(detail_keys), len(completed_detail_keys), len(pending_keys), checkpoint_batch_size)
                 consecutive_failures = 0
-
-                for position, key in enumerate(detail_keys, start=1):
-                    if key in completed_detail_keys:
-                        continue
-                    if failed_attempts.get(key, 0) >= max_detail_attempts:
-                        continue
-                    record = records_by_key.get(key)
-                    if not record or not record.url:
+                since_last_save = 0
+                for key in pending_keys:
+                    record = relevant_store.get(key)
+                    if not record:
                         completed_detail_keys.add(key)
-                        processed_detail_count += 1
-                        since_checkpoint += 1
                         continue
-
-                    record_succeeded = False
-                    while failed_attempts.get(key, 0) < max_detail_attempts and not record_succeeded:
-                        self.current_keyword = record.source_keyword
-                        self.capture_mode = "detail"
-                        self.active_video_id = record.video_id
+                    success = False
+                    last_error = ""
+                    for attempt in range(failed_attempts.get(key, 0), max_attempts):
                         try:
-                            page.goto(record.url, wait_until="domcontentloaded")
-                            page.wait_for_timeout(detail_wait_ms)
-                            self.check_verification(page, f"detail_{position}")
-                            detail_store = RecordStore(self.platform)
-                            self.parse_embedded_json(page, f"detail:{record.video_id or position}", detail_store)
-                            for candidate in detail_store.values():
-                                if candidate.video_id == record.video_id:
-                                    self.store.add(candidate)
-                            self.parse_meta(page, record)
-                            completed_detail_keys.add(key)
-                            record_succeeded = True
-                            consecutive_failures = 0
-                        except CollectorNeedsAttention:
-                            save_progress(f"详情 {position}/{total_details} 遇到验证，安全停机")
+                            self.wait_for_verification_if_needed(f"detail_loop_{record.video_id}_before_attempt")
+                            self.enrich_record(record)
+                            failed_attempts[key] = attempt + 1
+                            success = bool(record.title or record.likes or record.comments or record.shares or record.favorites or record.create_time)
+                            if success:
+                                break
+                            last_error = "详情没有返回可验证字段"
+                        except VerificationRequiredError:
+                            save_checkpoint("detail", note="验证码停止前自动保存")
                             raise
                         except Exception as exc:
-                            failed_attempts[key] = failed_attempts.get(key, 0) + 1
-                            consecutive_failures += 1
-                            logging.warning(
-                                "[%s] 详情失败 %d/%d（本条第 %d/%d 次）：%s",
-                                PLATFORM_LABELS[self.platform], position, total_details,
-                                failed_attempts[key], max_detail_attempts, str(exc)[:180]
-                            )
-                            if failed_attempts[key] < max_detail_attempts:
-                                backoff = min(
-                                    failure_backoff_max,
-                                    failure_backoff_base * (2 ** max(0, consecutive_failures - 1)),
-                                )
-                                logging.info("[%s] %.1f 秒后重试当前视频。", PLATFORM_LABELS[self.platform], backoff)
-                                time.sleep(backoff + random.uniform(0.3, 1.8))
-                            else:
-                                record.data_quality_notes.append(f"详情补全失败，已尝试 {max_detail_attempts} 次")
-
-                            if consecutive_failures == failure_cooldown_after:
-                                cooldown = random.uniform(cooldown_min, cooldown_max)
-                                logging.warning(
-                                    "[%s] 连续失败 %d 次，冷却 %.0f 秒后继续。",
-                                    PLATFORM_LABELS[self.platform], consecutive_failures, cooldown
-                                )
-                                save_progress("连续失败触发冷却")
-                                time.sleep(cooldown)
-                            if consecutive_failures >= failure_abort_after:
-                                save_progress("连续失败达到停机阈值")
-                                raise EmptyDataError(
-                                    f"[{PLATFORM_LABELS[self.platform]}] 连续 {consecutive_failures} 次详情加载失败。"
-                                    "程序已保存断点并停止，避免继续触发风控；稍后直接重跑即可续传。"
-                                )
-                        finally:
-                            self.capture_mode = "idle"
-                            self.active_video_id = ""
-
+                            failed_attempts[key] = attempt + 1
+                            last_error = str(exc)
+                            backoff = min(float(self.browser_config.get("failure_backoff_max_seconds", 45)), float(self.browser_config.get("failure_backoff_base_seconds", 3)) * (2 ** attempt))
+                            logging.warning("[%s] 详情失败 %s，第 %d/%d 次：%s；等待 %.1f 秒", self.label, record.url, attempt + 1, max_attempts, exc, backoff)
+                            self.monitored_sleep(backoff + random.uniform(0, 2.0), phase=f"detail_retry_{record.video_id}")
+                    if success:
+                        consecutive_failures = 0
+                    else:
+                        consecutive_failures += 1
+                        record.data_quality_notes.append(f"详情补全失败：{last_error or '未知错误'}")
+                    completed_detail_keys.add(key)
                     processed_detail_count += 1
-                    since_checkpoint += 1
-
-                    if since_checkpoint >= checkpoint_batch_size:
-                        save_progress(f"详情批次保存：已处理 {processed_detail_count}/{total_details}")
-                        logging.info(
-                            "[%s] 断点已保存：已处理 %d/%d，成功 %d，最大重试失败 %d",
-                            PLATFORM_LABELS[self.platform], processed_detail_count, total_details,
-                            len(completed_detail_keys),
-                            sum(1 for item in detail_keys if failed_attempts.get(item, 0) >= max_detail_attempts),
-                        )
-                        since_checkpoint = 0
-                        if any(item not in completed_detail_keys and failed_attempts.get(item, 0) < max_detail_attempts for item in detail_keys):
-                            rest = random.uniform(batch_rest_min, batch_rest_max)
-                            logging.info("[%s] 批次冷却 %.0f 秒，降低连续访问风险。", PLATFORM_LABELS[self.platform], rest)
-                            time.sleep(rest)
-
-                    time.sleep(random.uniform(detail_delay_min, detail_delay_max))
-
+                    since_last_save += 1
+                    if since_last_save >= checkpoint_batch_size:
+                        save_checkpoint("detail", note=f"批次保存至 {processed_detail_count}/{len(detail_keys)}")
+                        logging.info("[%s] 断点已保存：已处理 %d/%d，成功 %d，最大重试失败 %d", self.label, processed_detail_count, len(detail_keys), processed_detail_count - consecutive_failures, consecutive_failures)
+                        since_last_save = 0
+                        rest_min = float(self.browser_config.get("batch_rest_min_seconds", 18))
+                        rest_max = max(rest_min, float(self.browser_config.get("batch_rest_max_seconds", 40)))
+                        rest = random.uniform(rest_min, rest_max)
+                        logging.info("[%s] 批次冷却 %.0f 秒，降低连续访问风险。", self.label, rest)
+                        self.monitored_sleep(rest, phase=f"detail_batch_rest_{processed_detail_count}")
+                    if consecutive_failures == consecutive_cooldown_after:
+                        cool_min = float(self.browser_config.get("cooldown_min_seconds", 45))
+                        cool_max = max(cool_min, float(self.browser_config.get("cooldown_max_seconds", 90)))
+                        cooldown = random.uniform(cool_min, cool_max)
+                        logging.warning("[%s] 已连续失败 %d 次，冷却 %.0f 秒。", self.label, consecutive_failures, cooldown)
+                        self.monitored_sleep(cooldown, phase=f"detail_failure_cooldown_{processed_detail_count}")
+                    if consecutive_failures >= consecutive_abort_after:
+                        save_checkpoint("detail", note="连续详情失败，安全停止")
+                        raise EmptyDataError(f"[{self.label}] 连续 {consecutive_failures} 条详情加载失败，已保存断点并安全停止。请稍后用 run_visible.bat 检查登录或验证。")
+                    delay_min = float(self.browser_config.get("detail_delay_min_seconds", 2.2))
+                    delay_max = max(delay_min, float(self.browser_config.get("detail_delay_max_seconds", 4.8)))
+                    self.monitored_sleep(random.uniform(delay_min, delay_max), phase=f"detail_gap_{record.video_id}")
+                if since_last_save:
+                    save_checkpoint("detail", note="详情末尾保存")
                 phase = "complete"
-                save_progress("详情补全完成")
-                logging.info(
-                    "[%s] 详情补全结束：成功 %d/%d，达到最大重试仍失败 %d",
-                    PLATFORM_LABELS[self.platform], len(completed_detail_keys), len(detail_keys),
-                    sum(1 for key in detail_keys if failed_attempts.get(key, 0) >= max_detail_attempts)
-                )
-        except BaseException:
-            try:
-                save_progress("异常/中止前最后保存")
-            except Exception as save_exc:
-                logging.error("[%s] 异常前保存断点失败：%s", PLATFORM_LABELS[self.platform], save_exc)
-            raise
-        finally:
-            self.capture_mode = "idle"
-            context.close()
+                save_checkpoint("complete", note="采集完成")
+            except KeyboardInterrupt:
+                save_checkpoint(phase, note="用户 Ctrl+C 中断")
+                logging.warning("[%s] 收到 Ctrl+C，进度已保存，可下次继续。", self.label)
+                raise
+            except Exception:
+                save_checkpoint(phase, note="异常退出前自动保存")
+                raise
+            finally:
+                try:
+                    self.context.close()
+                except Exception:
+                    pass
 
-        final_records = self.store.values()
-        diagnostics = {
-            "platform": self.platform,
-            "platform_label": PLATFORM_LABELS[self.platform],
-            "keywords": keywords,
-            "candidate_count": len(final_records),
-            "with_create_time": sum(1 for r in final_records if r.create_time),
-            "with_views": sum(1 for r in final_records if r.views > 0),
-            "with_likes": sum(1 for r in final_records if r.likes > 0),
-            "with_followers": sum(1 for r in final_records if r.followers > 0),
-            "response_seen": self.response_seen,
-            "response_parsed": self.response_parsed,
-            "response_errors": self.response_errors,
-            "verification_count": self.captcha_count,
-            "checkpoint": str(checkpoint.path),
-            "checkpoint_phase": phase,
-            "detail_total": len(detail_keys),
-            "detail_completed": len(completed_detail_keys),
-            "detail_failed_max_retries": sum(1 for key in detail_keys if failed_attempts.get(key, 0) >= max_detail_attempts),
-        }
+        final_records = [record for record in relevant_store.values() if prefilter_record(record, self.config)]
+        diagnostics["detail_queue_count"] = len(detail_keys)
+        diagnostics["detail_completed_count"] = len(completed_detail_keys)
+        diagnostics["detail_failed_attempts"] = sum(1 for value in failed_attempts.values() if value >= max_attempts)
+        diagnostics["repeated_warning_count"] = repeated_warning_count
         return final_records, diagnostics
 
 
-def short_url(url: str, max_len: int = 90) -> str:
-    return url if len(url) <= max_len else url[: max_len - 3] + "..."
+def ensure_directories(config: Mapping[str, Any]) -> None:
+    for path in [DATA_DIR, PROFILE_DIR, LOG_DIR, APP_DIR / str(config.get("output_root", "output")), APP_DIR / "debug_screenshots", DATA_DIR / "checkpoints", DATA_DIR / "locks"]:
+        path.mkdir(parents=True, exist_ok=True)
 
 
-def login_platform(playwright: Playwright, platform: str, config: Mapping[str, Any]) -> None:
-    platform_config = config.get("platforms", {}).get(platform, {})
-    collector = PlatformCollector(
-        playwright,
-        platform,
-        config,
-        platform_config,
-        APP_DIR / "debug_screenshots" / "login",
-        headless_override=False,
-    )
-    context = collector.launch_context()
-    page = context.pages[0] if context.pages else context.new_page()
-    try:
-        page.goto(PLATFORM_HOME[platform], wait_until="domcontentloaded")
-        print(f"\n已打开 {PLATFORM_LABELS[platform]}。请在浏览器中正常登录，确认首页可用后回到此窗口按回车。")
-        input()
-    finally:
-        context.close()
+def setup_logging() -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    handlers = [logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler(sys.stdout)]
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s,%(msecs)03d | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S", handlers=handlers, force=True)
 
 
-def content_text_blob(record: VideoRecord) -> str:
-    """只包含视频/作者自身文字，不把我们的搜索关键词当成内容证据。"""
-    return " ".join([record.title, record.author_name, record.author_id, record.music, " ".join(record.hashtags)]).casefold()
-
-
-def text_blob(record: VideoRecord) -> str:
-    return f"{content_text_blob(record)} {record.source_keyword}".casefold()
-
-
-def compute_dance_relevance(record: VideoRecord) -> float:
-    # Search keyword is provenance, not proof. Most of the score must come from the
-    # video's own title, hashtags, author text or music.
-    content = content_text_blob(record)
-    source = record.source_keyword.casefold()
-    matches = sum(1 for term in DANCE_TERMS if term.casefold() in content)
-    score = min(70.0, matches * 15.0)
-    if record.hashtags:
-        tag_text = " ".join(record.hashtags).casefold()
-        if any(term.casefold() in tag_text for term in DANCE_TERMS):
-            score += 20.0
-    if any(term.casefold() in source for term in DANCE_TERMS):
-        score += 10.0
-    return min(100.0, score)
-
-
-def contains_any(text: str, terms: Iterable[str]) -> bool:
-    low = text.casefold()
-    return any(normalize_text(term).casefold() in low for term in terms if normalize_text(term))
-
-
-
-def matching_terms(text: str, terms: Iterable[str]) -> list[str]:
-    low = normalize_text(text).casefold()
-    return [term for term in terms if normalize_text(term).casefold() in low]
-
-
-def first_matching_term(text: str, terms: Iterable[str]) -> str:
-    matches = matching_terms(text, terms)
-    return matches[0] if matches else ""
-
-
-def evaluate_target_match(record: VideoRecord, filters: Mapping[str, Any]) -> tuple[float, str, bool, bool, bool, str]:
-    """Conservative text relevance filter.
-
-    Search terms are only a small recall hint. The old implementation gave up to 74
-    points merely because a random recommendation was captured under a good keyword;
-    that is why landscapes, films and tutorials ranked highly.
-    """
-    content = content_text_blob(record)
-    source = normalize_text(record.source_keyword).casefold()
-
-    minor_terms = filters.get("minor_terms", [])
-    male_terms = filters.get("male_terms", list(MALE_EXCLUDE_TERMS))
-    group_terms = filters.get("group_terms", list(GROUP_EXCLUDE_TERMS))
-    format_terms = filters.get("format_exclude_terms", list(FORMAT_EXCLUDE_TERMS))
-    non_human_terms = filters.get("non_human_terms", list(NON_HUMAN_EXCLUDE_TERMS))
-    female_terms = filters.get("female_text_terms", list(FEMALE_TARGET_TERMS))
-    solo_terms = filters.get("solo_terms", list(SOLO_TARGET_TERMS))
-    sexy_terms = filters.get("sexy_style_terms", list(SEXY_STYLE_TERMS))
-
-    for label, terms in (
-        ("疑似未成年人文字信号", minor_terms),
-        ("男性舞者文字信号", male_terms),
-        ("多人/双人/群舞文字信号", group_terms),
-        ("教程/合集/搬运文字信号", format_terms),
-        ("AI/动漫/虚拟角色文字信号", non_human_terms),
-    ):
-        hit = first_matching_term(content, terms)
-        if hit:
-            return 0.0, "排除", False, False, False, f"{label}：{hit}"
-
-    female_signal = contains_any(content, female_terms)
-    solo_signal = contains_any(content, solo_terms)
-    sexy_signal = contains_any(content, sexy_terms)
-    dance_hits = sum(1 for term in DANCE_TERMS if term.casefold() in content)
-    sexy_hits = len(matching_terms(content, sexy_terms))
-    female_hits = len(matching_terms(content, female_terms))
-    solo_hits = len(matching_terms(content, solo_terms))
-
-    score = 0.0
-    score += min(32.0, sexy_hits * 10.0)
-    score += min(20.0, female_hits * 10.0)
-    score += min(18.0, solo_hits * 9.0)
-    score += min(24.0, dance_hits * 8.0)
-    if contains_any(content, [
-        "辣妹热舞", "小姐姐热舞", "单人热舞", "御姐热舞", "扭胯舞",
-        "摇胯舞", "高跟鞋舞", "椅子舞", "纯御舞", "性感纯欲舞"
-    ]):
-        score += 12.0
-
-    # Retrieval hint only. It can never turn unrelated content into a strong match.
-    if any(term.casefold() in source for term in DANCE_TERMS):
-        score += 4.0
-    if contains_any(source, sexy_terms):
-        score += 4.0
-    if contains_any(source, female_terms):
-        score += 2.0
-
-    score = min(100.0, score)
-    if score >= 62:
-        level = "A-强匹配"
-    elif score >= 34:
-        level = "B-较匹配"
-    else:
-        level = "C-宽松候选"
-    return score, level, female_signal, solo_signal, sexy_signal, ""
-
-
-def topic_tokens(record: VideoRecord) -> set[str]:
-    tokens: set[str] = set()
-    raw_parts = [record.music, record.source_keyword, *record.hashtags, record.title]
-    for raw in raw_parts:
-        text = normalize_text(raw).casefold()
-        if not text:
-            continue
-        for word in WORD_PATTERN.findall(text):
-            cleaned = word.strip("_- ").casefold()
-            if cleaned and cleaned not in GENERIC_TOPIC_STOPWORDS and len(cleaned) >= 3:
-                tokens.add(cleaned)
-        for run in CJK_RUN_PATTERN.findall(text):
-            if run not in GENERIC_TOPIC_STOPWORDS:
-                tokens.add(run)
-            # 加入 2～4 字片段，提高中英文跨平台音乐名/挑战名匹配能力。
-            for n in (2, 3, 4):
-                if len(run) >= n:
-                    for i in range(len(run) - n + 1):
-                        piece = run[i : i + n]
-                        if piece not in GENERIC_TOPIC_STOPWORDS:
-                            tokens.add(piece)
-        for tag in HASHTAG_PATTERN.findall(text):
-            cleaned = tag.casefold()
-            if cleaned not in GENERIC_TOPIC_STOPWORDS:
-                tokens.add(cleaned)
-    return tokens
-
-
-def normalized_music(music: str) -> str:
-    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", normalize_text(music).casefold())
-
-
-def assign_cross_platform_scores(records: list[VideoRecord]) -> None:
-    by_platform: dict[str, list[tuple[VideoRecord, set[str], str]]] = defaultdict(list)
-    for record in records:
-        by_platform[record.platform].append((record, topic_tokens(record), normalized_music(record.music)))
-
-    for record in records:
-        tokens = topic_tokens(record)
-        music = normalized_music(record.music)
-        matched_platforms: set[str] = set()
-        for other_platform, rows in by_platform.items():
-            if other_platform == record.platform:
-                continue
-            for other, other_tokens, other_music in rows:
-                music_match = bool(music and other_music and len(music) >= 4 and (music == other_music or music in other_music or other_music in music))
-                if tokens and other_tokens:
-                    intersection = len(tokens & other_tokens)
-                    union = len(tokens | other_tokens)
-                    jaccard = intersection / union if union else 0.0
-                else:
-                    jaccard = 0.0
-                if music_match or jaccard >= 0.18 or len(tokens & other_tokens) >= 2:
-                    matched_platforms.add(other_platform)
-                    break
-        if len(matched_platforms) >= 2:
-            record.cross_platform_score = 100.0
-        elif len(matched_platforms) == 1:
-            record.cross_platform_score = 70.0
-        else:
-            record.cross_platform_score = 0.0
-
-
-def percentile_ranks(values: list[float]) -> list[float]:
-    if not values:
-        return []
-    if len(values) == 1:
-        return [100.0]
-    sorted_pairs = sorted(enumerate(values), key=lambda pair: pair[1])
-    ranks = [0.0] * len(values)
-    i = 0
-    while i < len(sorted_pairs):
-        j = i
-        while j + 1 < len(sorted_pairs) and sorted_pairs[j + 1][1] == sorted_pairs[i][1]:
-            j += 1
-        average_position = (i + j) / 2
-        percentile = average_position / (len(values) - 1) * 100.0
-        for k in range(i, j + 1):
-            ranks[sorted_pairs[k][0]] = percentile
-        i = j + 1
-    return ranks
-
-
-def score_records(records: list[VideoRecord], config: Mapping[str, Any], window: DateWindow, tz: ZoneInfo) -> tuple[list[VideoRecord], dict[str, list[VideoRecord]]]:
-    filters = config.get("filters", {})
-    min_target = float(filters.get("minimum_target_match", 8))
-    min_dance = float(filters.get("minimum_dance_relevance", 12))
-
-    eligible: list[VideoRecord] = []
-    for record in records:
-        record.dance_relevance = compute_dance_relevance(record)
-        score, level, female, solo, sexy, reason = evaluate_target_match(record, filters)
-        record.target_match_score = score
-        record.match_level = level
-        record.female_text_signal = female
-        record.solo_text_signal = solo
-        record.sexy_style_signal = sexy
-        record.exclusion_reason = reason
-        if reason:
-            if not any(reason in note for note in record.data_quality_notes):
-                record.data_quality_notes.append(f"文本初筛排除：{reason}")
-            continue
-        if record.dance_relevance < min_dance:
-            record.data_quality_notes.append(f"舞蹈相关度低于阈值 {min_dance:g}，未进入候选榜")
-            continue
-        if record.target_match_score < min_target:
-            record.data_quality_notes.append(f"目标匹配度低于阈值 {min_target:g}，未进入候选榜")
-            continue
-        local_time = record.local_create_time(tz)
-        if not local_time:
-            record.data_quality_notes.append("缺少可验证发布时间，未进入正式周榜")
-            continue
-        if not (window.start <= local_time < window.end):
-            continue
-
-        age_hours = max((window.end - local_time).total_seconds() / 3600.0, 1.0)
-        record.likes_per_hour = record.likes / age_hours if record.likes > 0 else 0.0
-        record.velocity_per_hour = record.likes_per_hour
-        # 旧字段保留用于兼容，但不再用缺失的粉丝/播放构造失真互动率。
-        total_interactions = record.likes + record.comments + record.shares + record.favorites
-        if record.views > 0:
-            record.engagement_rate = total_interactions / record.views
-            record.engagement_basis = "views"
-        else:
-            record.engagement_rate = 0.0
-            record.engagement_basis = "not_scored"
-        eligible.append(record)
-
-    by_platform: dict[str, list[VideoRecord]] = defaultdict(list)
-    for record in eligible:
-        by_platform[record.platform].append(record)
-
-    weights = config.get("scoring", {})
-    w_likes = float(weights.get("likes", 0.25))
-    w_comments = float(weights.get("comments", 0.10))
-    w_shares = float(weights.get("shares", 0.20))
-    w_favorites = float(weights.get("favorites", 0.15))
-    w_velocity = float(weights.get("likes_velocity", 0.20))
-    w_target = float(weights.get("target_match", 0.10))
-
-    for platform, rows in by_platform.items():
-        likes = [math.log1p(r.likes) for r in rows]
-        comments = [math.log1p(r.comments) for r in rows]
-        shares = [math.log1p(r.shares) for r in rows]
-        favorites = [math.log1p(r.favorites) for r in rows]
-        velocity = [math.log1p(r.likes_per_hour) for r in rows]
-        targets = [r.target_match_score for r in rows]
-        pr_likes = percentile_ranks(likes)
-        pr_comments = percentile_ranks(comments)
-        pr_shares = percentile_ranks(shares)
-        pr_favorites = percentile_ranks(favorites)
-        pr_velocity = percentile_ranks(velocity)
-        pr_target = percentile_ranks(targets)
-        for i, record in enumerate(rows):
-            record.like_percentile = pr_likes[i]
-            record.comment_percentile = pr_comments[i]
-            record.share_percentile = pr_shares[i]
-            record.favorite_percentile = pr_favorites[i]
-            record.share_favorite_percentile = (pr_shares[i] + pr_favorites[i]) / 2
-            record.velocity_percentile = pr_velocity[i]
-            record.target_percentile = pr_target[i]
-            record.final_score = round(
-                record.like_percentile * w_likes
-                + record.comment_percentile * w_comments
-                + record.share_percentile * w_shares
-                + record.favorite_percentile * w_favorites
-                + record.velocity_percentile * w_velocity
-                + record.target_percentile * w_target,
-                2,
-            )
-        rows.sort(
-            key=lambda r: (r.final_score, r.target_match_score, r.likes, r.shares, r.favorites),
-            reverse=True,
-        )
-        for rank, record in enumerate(rows, start=1):
-            record.rank = rank
-
-    eligible.sort(key=lambda r: (r.platform, r.rank))
-    return eligible, by_platform
-
-
-def data_quality(record: VideoRecord) -> str:
-    missing: list[str] = []
-    if not record.create_time:
-        missing.append("发布时间")
-    if record.likes <= 0:
-        missing.append("点赞")
-    if record.comments <= 0:
-        missing.append("评论")
-    if record.shares <= 0:
-        missing.append("分享")
-    if record.favorites <= 0:
-        missing.append("收藏")
-    if missing:
-        return "缺：" + "、".join(missing)
-    return "核心字段完整"
-
-
-REPORT_COLUMNS = [
-    ("排名", "rank"),
-    ("总分", "final_score"),
-    ("匹配等级", "match_level"),
-    ("目标匹配分", "target_match_score"),
-    ("发布时间", "publish_time"),
-    ("标题/文案", "title"),
-    ("作者", "author_name"),
-    ("作者ID", "author_id"),
-    ("原视频链接", "url"),
-    ("点赞", "likes"),
-    ("评论", "comments"),
-    ("分享", "shares"),
-    ("收藏", "favorites"),
-    ("发布后每小时点赞", "likes_per_hour"),
-    ("点赞百分位", "like_percentile"),
-    ("评论百分位", "comment_percentile"),
-    ("分享百分位", "share_percentile"),
-    ("收藏百分位", "favorite_percentile"),
-    ("速度百分位", "velocity_percentile"),
-    ("匹配度百分位", "target_percentile"),
-    ("女性文字信号", "female_text_signal"),
-    ("单人文字信号", "solo_text_signal"),
-    ("性感/妩媚风格信号", "sexy_style_signal"),
-    ("音乐", "music"),
-    ("话题", "hashtags"),
-    ("来源关键词", "source_keyword"),
-    ("排除原因", "exclusion_reason"),
-    ("人工复核", "manual_review"),
-    ("数据质量", "data_quality"),
-    ("备注", "notes"),
-]
-
-
-def report_row(record: VideoRecord, tz: ZoneInfo) -> dict[str, Any]:
-    local_time = record.local_create_time(tz)
-    return {
-        "rank": record.rank,
-        "final_score": record.final_score,
-        "match_level": record.match_level,
-        "target_match_score": round(record.target_match_score, 2),
-        "publish_time": local_time.strftime("%Y-%m-%d %H:%M:%S") if local_time else "",
-        "title": record.title,
-        "author_name": record.author_name,
-        "author_id": record.author_id,
-        "url": record.url,
-        "likes": record.likes,
-        "comments": record.comments,
-        "shares": record.shares,
-        "favorites": record.favorites,
-        "likes_per_hour": round(record.likes_per_hour, 2),
-        "like_percentile": round(record.like_percentile, 2),
-        "comment_percentile": round(record.comment_percentile, 2),
-        "share_percentile": round(record.share_percentile, 2),
-        "favorite_percentile": round(record.favorite_percentile, 2),
-        "velocity_percentile": round(record.velocity_percentile, 2),
-        "target_percentile": round(record.target_percentile, 2),
-        "female_text_signal": "有" if record.female_text_signal else "未发现（需看图）",
-        "solo_text_signal": "有" if record.solo_text_signal else "未发现（需看图）",
-        "sexy_style_signal": "有" if record.sexy_style_signal else "主要来自搜索词",
-        "music": record.music,
-        "hashtags": " #".join(record.hashtags) if record.hashtags else "",
-        "source_keyword": record.source_keyword,
-        "exclusion_reason": record.exclusion_reason,
-        "manual_review": "待看封面/视频",
-        "data_quality": data_quality(record),
-        "notes": "；".join(unique_preserve(record.data_quality_notes)),
-        "thumbnail": record.thumbnail,
-    }
-
-
-def write_csv(path: Path, records: list[VideoRecord], tz: ZoneInfo) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[key for _, key in REPORT_COLUMNS])
+def write_csv(path: Path, records: list[VideoRecord], tz: Any) -> None:
+    fields = ["排名", "总分", "平台", "视频链接", "标题", "作者", "发布时间", "播放", "点赞", "评论", "分享", "收藏", "发布后每小时点赞", "目标匹配度", "匹配级别", "女性文本信号", "单人文本信号", "性感风格信号", "来源关键词", "数据质量"]
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for record in records:
-            row = report_row(record, tz)
-            writer.writerow({key: row.get(key, "") for _, key in REPORT_COLUMNS})
+            writer.writerow({
+                "排名": record.rank,
+                "总分": round(record.final_score, 2),
+                "平台": PLATFORM_LABELS[record.platform],
+                "视频链接": record.url,
+                "标题": record.title,
+                "作者": record.author_name,
+                "发布时间": record.local_create_time(tz).strftime("%Y-%m-%d %H:%M:%S") if record.local_create_time(tz) else "",
+                "播放": record.views,
+                "点赞": record.likes,
+                "评论": record.comments,
+                "分享": record.shares,
+                "收藏": record.favorites,
+                "发布后每小时点赞": round(record.likes_per_hour, 2),
+                "目标匹配度": round(record.target_match_score, 2),
+                "匹配级别": record.match_level,
+                "女性文本信号": "是（仅文字）" if record.female_text_signal else "待人工确认",
+                "单人文本信号": "是" if record.solo_text_signal else "待人工确认",
+                "性感风格信号": "是" if record.sexy_style_signal else "待人工确认",
+                "来源关键词": record.source_keyword,
+                "数据质量": "；".join(record.data_quality_notes),
+            })
 
 
-def style_sheet(ws, max_row: int, max_col: int) -> None:
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-    top_fill = PatternFill("solid", fgColor="FFF2CC")
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(max_col)}{max_row}"
-    for row in range(2, min(max_row, 11) + 1):
-        for col in range(1, max_col + 1):
-            ws.cell(row=row, column=col).fill = top_fill
-    for row in ws.iter_rows(min_row=2, max_row=max_row):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-    widths = {
-        1: 7, 2: 9, 3: 14, 4: 13, 5: 20, 6: 52, 7: 18, 8: 18, 9: 56,
-        10: 12, 11: 12, 12: 12, 13: 12, 14: 18, 15: 13, 16: 13, 17: 13,
-        18: 13, 19: 13, 20: 14, 21: 16, 22: 16, 23: 19, 24: 24, 25: 34,
-        26: 18, 27: 24, 28: 18, 29: 20, 30: 46,
-    }
-    for col, width in widths.items():
-        ws.column_dimensions[get_column_letter(col)].width = width
-    if max_row >= 2:
-        ws.conditional_formatting.add(
-            f"B2:B{max_row}",
-            ColorScaleRule(start_type="min", start_color="F8696B", mid_type="percentile", mid_value=50, mid_color="FFEB84", end_type="max", end_color="63BE7B"),
-        )
-
-
-def write_excel(path: Path, top_by_platform: Mapping[str, list[VideoRecord]], all_eligible: list[VideoRecord], all_candidates: list[VideoRecord], diagnostics: Mapping[str, Any], window: DateWindow, tz: ZoneInfo, config: Mapping[str, Any]) -> None:
-    platforms = enabled_platforms(config)
-    top_n = int(config.get("top_n_per_platform", 50))
-    total = top_n * len(platforms)
+def write_excel(path: Path, platform_records: Mapping[str, list[VideoRecord]], tz: Any, diagnostics: Mapping[str, Any]) -> None:
     wb = Workbook()
-    summary = wb.active
-    summary.title = "说明与汇总"
-    summary["A1"] = f"{' / '.join(PLATFORM_LABELS[p] for p in platforms)} 每周舞蹈 Top{total}"
-    summary["A1"].font = Font(size=18, bold=True)
-    summary["A3"] = "统计窗口"
-    summary["B3"] = window.label
-    summary["A4"] = "窗口模式"
-    summary["B4"] = window.mode
-    summary["A5"] = "生成时间"
-    summary["B5"] = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
-    summary["A6"] = "评分"
-    summary["B6"] = "点赞25% + 分享20% + 收藏15% + 评论10% + 每小时点赞20% + 目标匹配度10%"
-    summary["A7"] = "重要限制"
-    summary["B7"] = "脚本先排除明确男性、多人、教程、未成年人、AI/动漫文字信号，再输出100条大候选池。单人、女性、成年和风格仍必须人工看封面/视频复核。"
-    summary["A9"] = "平台"
-    summary["B9"] = "候选数"
-    summary["C9"] = "时间窗口内合格数"
-    summary["D9"] = "正式榜数量"
-    for cell in summary[9]:
-        cell.fill = PatternFill("solid", fgColor="1F4E78")
-        cell.font = Font(color="FFFFFF", bold=True)
-    for idx, platform in enumerate(platforms, start=10):
-        diag = diagnostics.get(platform, {}) if isinstance(diagnostics, Mapping) else {}
-        summary.cell(idx, 1, PLATFORM_LABELS[platform])
-        summary.cell(idx, 2, int(diag.get("candidate_count", 0)))
-        summary.cell(idx, 3, len([r for r in all_eligible if r.platform == platform]))
-        summary.cell(idx, 4, len(top_by_platform.get(platform, [])))
-    summary.column_dimensions["A"].width = 20
-    summary.column_dimensions["B"].width = 82
-    summary.column_dimensions["C"].width = 20
-    summary.column_dimensions["D"].width = 18
-    summary["B7"].alignment = Alignment(wrap_text=True)
-
-    def add_record_sheet(name: str, records: list[VideoRecord]) -> None:
-        ws = wb.create_sheet(name)
-        ws.append([label for label, _ in REPORT_COLUMNS])
+    wb.remove(wb.active)
+    headers = ["排名", "总分", "封面", "视频/作者", "发布时间", "播放", "点赞", "评论", "分享", "收藏", "每小时点赞", "目标匹配", "匹配级别", "女性文本", "单人文本", "性感风格", "来源关键词", "数据质量", "视频链接"]
+    for platform in enabled_platforms({"platforms": {key: {"enabled": key in platform_records} for key in ("douyin", "kuaishou", "tiktok")}}):
+        records = platform_records.get(platform, [])
+        ws = wb.create_sheet(f"{PLATFORM_LABELS[platform]}Top{len(records)}")
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="1F4E78")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
         for record in records:
-            row = report_row(record, tz)
-            ws.append([row.get(key, "") for _, key in REPORT_COLUMNS])
-        for row_idx in range(2, ws.max_row + 1):
-            link_cell = ws.cell(row=row_idx, column=9)
-            if link_cell.value:
-                link_cell.hyperlink = str(link_cell.value)
-                link_cell.font = Font(color="0563C1", underline="single")
-            for col in range(2, 5):
-                ws.cell(row=row_idx, column=col).number_format = "0.00"
-            for col in range(14, 21):
-                ws.cell(row=row_idx, column=col).number_format = "0.00"
-        style_sheet(ws, ws.max_row, ws.max_column)
-
-    for platform in platforms:
-        add_record_sheet(f"{PLATFORM_LABELS[platform]}_Top{top_n}", top_by_platform.get(platform, []))
-    add_record_sheet("窗口内全部合格", sorted(all_eligible, key=lambda r: (r.platform, r.rank)))
-
-    # 全候选用于排查为什么某条未进榜；不强行给缺时间记录排名。
-    all_sorted = sorted(all_candidates, key=lambda r: (r.platform, -(r.likes + r.comments + r.views)))
-    add_record_sheet("全部候选_含未入榜", all_sorted)
+            dt = record.local_create_time(tz)
+            ws.append([
+                record.rank, round(record.final_score, 2), record.thumbnail,
+                f"{record.title}\n{record.author_name}", dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "",
+                record.views, record.likes, record.comments, record.shares, record.favorites,
+                round(record.likes_per_hour, 2), round(record.target_match_score, 2), record.match_level,
+                "是（仅文字）" if record.female_text_signal else "待人工确认",
+                "是" if record.solo_text_signal else "待人工确认",
+                "是" if record.sexy_style_signal else "待人工确认",
+                record.source_keyword, "；".join(record.data_quality_notes), record.url,
+            ])
+            row = ws.max_row
+            ws.cell(row, 4).hyperlink = record.url
+            ws.cell(row, 4).style = "Hyperlink"
+            ws.cell(row, 19).hyperlink = record.url
+            ws.cell(row, 19).style = "Hyperlink"
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        widths = [8, 10, 28, 55, 20, 13, 13, 11, 11, 11, 14, 12, 14, 14, 12, 12, 24, 26, 45]
+        for index, width in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(index)].width = width
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+        if len(records) >= 2:
+            ws.conditional_formatting.add(f"B2:B{len(records)+1}", ColorScaleRule(start_type="min", start_color="F8696B", mid_type="percentile", mid_value=50, mid_color="FFEB84", end_type="max", end_color="63BE7B"))
+        diag_ws = wb.create_sheet(f"{PLATFORM_LABELS[platform]}诊断")
+        diag_ws.append(["字段", "内容"])
+        for key, value in diagnostics.get(platform, {}).items():
+            diag_ws.append([key, json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)])
+        diag_ws.column_dimensions["A"].width = 30
+        diag_ws.column_dimensions["B"].width = 120
     wb.save(path)
 
 
-def html_table(records: list[VideoRecord], tz: ZoneInfo) -> str:
-    rows: list[str] = []
-    for record in records:
-        r = report_row(record, tz)
-        thumb = f'<img loading="lazy" src="{html.escape(record.thumbnail)}" alt="封面">' if record.thumbnail else '<div class="noimg">无封面</div>'
-        title = html.escape(record.title or "（无标题）")
-        author = html.escape(record.author_name or record.author_id or "未知")
-        link = html.escape(record.url)
-        tags = html.escape(" #".join(record.hashtags))
-        signals = " / ".join([
-            "女性词✓" if record.female_text_signal else "女性词?",
-            "单人词✓" if record.solo_text_signal else "单人词?",
-            "风格词✓" if record.sexy_style_signal else "风格来自搜索词",
-        ])
-        rows.append(
-            f"""
-            <article class="card" data-url="{link}" data-rank="{record.rank}">
-              <label class="keep"><input type="checkbox" checked> 保留候选</label>
-              <a class="cover" href="{link}" target="_blank" rel="noopener">{thumb}</a>
-              <div class="cardbody">
-                <div class="topline"><b>#{record.rank}</b><span class="score">{record.final_score:.2f}</span><span class="level">{html.escape(record.match_level)}</span></div>
-                <a class="title" href="{link}" target="_blank" rel="noopener">{title}</a>
-                <div class="author">{author}</div>
-                <div class="stats">赞 {record.likes:,}　评 {record.comments:,}　分享 {record.shares:,}　收藏 {record.favorites:,}</div>
-                <div class="stats">每小时点赞 {record.likes_per_hour:,.0f}　匹配分 {record.target_match_score:.0f}</div>
-                <div class="signals">{html.escape(signals)}</div>
-                <div class="meta">{html.escape(r['publish_time'])}｜来源：{html.escape(record.source_keyword)}</div>
-                <div class="meta">{html.escape(record.music)} {tags}</div>
-              </div>
-            </article>
-            """
-        )
-    if not rows:
-        return '<div class="empty">没有足够的可验证候选，请查看诊断文件。</div>'
-    return "\n".join(rows)
+def html_escape(value: Any) -> str:
+    return html.escape(str(value or ""), quote=True)
 
 
-def write_html(path: Path, top_by_platform: Mapping[str, list[VideoRecord]], diagnostics: Mapping[str, Any], window: DateWindow, tz: ZoneInfo, config: Mapping[str, Any]) -> None:
-    platforms = enabled_platforms(config)
-    total = int(config.get("top_n_per_platform", 100)) * len(platforms)
-    title = f"{' / '.join(PLATFORM_LABELS[p] for p in platforms)} 单人女性热舞候选 Top{total}"
-    cards = "".join(html_table(top_by_platform.get(platform, []), tz) for platform in platforms)
-    diag_text = html.escape(json.dumps(diagnostics, ensure_ascii=False, indent=2))
-    doc = f"""<!doctype html>
+def write_html(path: Path, platform_records: Mapping[str, list[VideoRecord]], window: DateWindow, config: Mapping[str, Any], tz: Any) -> None:
+    all_records: list[VideoRecord] = []
+    for platform in enabled_platforms(config):
+        all_records.extend(platform_records.get(platform, []))
+    cards: list[str] = []
+    for index, record in enumerate(all_records, 1):
+        dt = record.local_create_time(tz)
+        record_id = f"{record.platform}_{record.video_id or index}"
+        cover = f'<img src="{html_escape(record.thumbnail)}" alt="封面" loading="lazy">' if record.thumbnail else '<div class="no-cover">暂无封面</div>'
+        cards.append(f"""
+        <article class="card" data-record-id="{html_escape(record_id)}">
+          <label class="keep"><input type="checkbox" checked> 保留候选</label>
+          <a class="cover" href="{html_escape(record.url)}" target="_blank" rel="noopener">{cover}</a>
+          <div class="content">
+            <div class="rank">#{record.rank} <strong>{record.final_score:.2f}</strong> <span>{html_escape(record.match_level)}</span></div>
+            <a class="title" href="{html_escape(record.url)}" target="_blank" rel="noopener">{html_escape(record.title or '无标题')}</a>
+            <p class="author">{html_escape(record.author_name)}</p>
+            <p class="stats">赞 {record.likes:,}　评 {record.comments:,}　分享 {record.shares:,}　收藏 {record.favorites:,}</p>
+            <p>每小时点赞 {record.likes_per_hour:,.0f}　匹配 {record.target_match_score:.0f}</p>
+            <p>女性词：{'是（仅文字）' if record.female_text_signal else '待人工确认'} / 单人词：{'是' if record.solo_text_signal else '待人工确认'} / 风格：{'是' if record.sexy_style_signal else '待人工确认'}</p>
+            <p>{html_escape(dt.strftime('%Y-%m-%d %H:%M:%S') if dt else '发布时间缺失')}｜来源：{html_escape(record.source_keyword)}</p>
+            <p class="topics">{html_escape(record.music)} {' '.join('#'+tag for tag in record.hashtags)}</p>
+          </div>
+        </article>""")
+    title = f"抖音 单人女性热舞候选 Top{int(config.get('top_n_per_platform', 100))}"
+    html_text = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{html.escape(title)}</title>
+<title>{html_escape(title)}</title>
 <style>
-*{{box-sizing:border-box}} body{{font-family:Arial,"Microsoft YaHei",sans-serif;margin:0;background:#f3f5f8;color:#17212b}}
-header{{background:#172b4d;color:white;padding:22px 28px;position:sticky;top:0;z-index:9}} header h1{{margin:0 0 8px;font-size:25px}}
-header p{{margin:4px 0;color:#dce6f2}} main{{padding:18px}}
-.notice{{background:#fff6d9;border-left:5px solid #d69e2e;padding:13px 15px;margin-bottom:14px;line-height:1.65}}
-.toolbar{{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 16px;position:sticky;top:105px;z-index:8;background:#f3f5f8;padding:8px 0}}
-button{{border:0;border-radius:7px;padding:10px 15px;cursor:pointer;font-weight:700;background:#1f4e78;color:white}}
-button.secondary{{background:#64748b}} #counter{{padding:10px 0;font-weight:700}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(285px,1fr));gap:15px}}
-.card{{background:white;border:2px solid transparent;border-radius:10px;overflow:hidden;box-shadow:0 2px 9px rgba(0,0,0,.08);position:relative}}
-.card.removed{{opacity:.35;border-color:#dc3545}} .card.hidden{{display:none}}
-.keep{{position:absolute;top:8px;left:8px;background:rgba(0,0,0,.72);color:white;padding:6px 9px;border-radius:6px;z-index:2;font-size:13px}}
-.cover{{display:block;background:#ddd;height:360px}} .cover img{{width:100%;height:100%;object-fit:cover;display:block}} .noimg{{height:100%;display:grid;place-items:center;color:#666}}
-.cardbody{{padding:12px}} .topline{{display:flex;gap:8px;align-items:center;margin-bottom:8px}} .score{{font-size:20px;font-weight:800;color:#157347}}
-.level{{font-size:12px;background:#e8eef5;padding:4px 7px;border-radius:10px}} .title{{display:block;color:#0b61a4;font-weight:700;line-height:1.45;text-decoration:none}}
-.author,.meta,.signals{{font-size:12px;color:#66788a;margin-top:6px;line-height:1.4}} .stats{{font-size:13px;margin-top:7px}} details{{margin-top:22px;background:white;padding:14px}} pre{{white-space:pre-wrap;word-break:break-all;font-size:12px}}
-@media(max-width:700px){{header{{position:static}} .toolbar{{top:0}} .cover{{height:430px}}}}
-</style></head>
-<body><header><h1>{html.escape(title)}</h1><p>统计窗口：{html.escape(window.label)}</p><p>评分：点赞25% + 分享20% + 收藏15% + 评论10% + 每小时点赞20% + 目标匹配度10%</p></header>
-<main><div class="notice"><b>用途：</b>这是100条“大候选池”，方便你人工删到最终Top50。程序只采集真正的搜索结果，并排除标题中明确的男性、多人/双人/群舞、教程/合集、未成年人及AI/动漫内容；但不会仅凭外貌自动断言性别或成年，仍要点开视频复核。</div>
-<div class="toolbar"><button id="showAll">显示全部</button><button id="hideRemoved" class="secondary">隐藏已删除</button><button id="exportCsv">导出保留链接CSV</button><button id="reset" class="secondary">重置选择</button><span id="counter"></span></div>
-<div class="grid">{cards}</div>
-<details><summary>采集诊断</summary><pre>{diag_text}</pre></details></main>
+body{{margin:0;background:#f4f6fa;color:#14213d;font-family:Arial,"Microsoft YaHei",sans-serif}}header{{background:#19345d;color:#fff;padding:22px}}h1{{margin:0 0 8px}}.note{{margin:18px;background:#fff7d9;border-left:5px solid #d8a20a;padding:13px}}.toolbar{{position:sticky;top:0;z-index:4;background:#edf1f7;padding:12px 18px;display:flex;gap:10px;align-items:center}}button{{border:0;border-radius:5px;padding:10px 14px;background:#245c8d;color:white;font-weight:700}}.secondary{{background:#73829a}}.grid{{padding:18px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}}.card{{position:relative;background:white;border-radius:10px;overflow:hidden;box-shadow:0 2px 10px #0001}}.card.removed{{opacity:.25}}.keep{{position:absolute;z-index:2;top:8px;left:8px;background:#13345dcc;color:white;padding:7px;border-radius:5px}}.cover{{display:block;height:360px;background:#1d2737}}.cover img{{width:100%;height:100%;object-fit:cover}}.no-cover{{height:100%;display:grid;place-items:center;color:#ccc}}.content{{padding:12px}}.rank{{font-size:18px;margin-bottom:8px}}.rank strong{{color:#087f5b}}.rank span{{font-size:12px;border:1px solid #ccd5df;border-radius:10px;padding:3px 6px}}.title{{font-weight:700;color:#075985;text-decoration:none}}p{{margin:7px 0;line-height:1.45}}.author,.topics{{color:#667085;font-size:13px}}
+</style></head><body>
+<header><h1>{html_escape(title)}</h1><div>统计窗口：{html_escape(window.label)}</div><div>评分：点赞25% + 分享20% + 收藏15% + 评论10% + 每小时点赞20% + 目标匹配度10%</div></header>
+<div class="note"><b>用途：</b>这是最多100条“大候选池”，方便人工删到最终Top50。程序不会仅凭外貌自动断言人物性别或成年，仍需打开视频复核。</div>
+<div class="toolbar"><button onclick="showAll()">显示全部</button><button class="secondary" onclick="hideRemoved()">隐藏已删除</button><button onclick="exportCsv()">导出保留链接CSV</button><button class="secondary" onclick="resetAll()">重置选择</button><b id="counter"></b></div>
+<main class="grid">{''.join(cards)}</main>
 <script>
-const cards=[...document.querySelectorAll('.card')];
-const key='douyin_top100_review_'+location.pathname;
-let state={{}}; try{{state=JSON.parse(localStorage.getItem(key)||'{{}}')}}catch(e){{state={{}}}}
-function update(){{let kept=0; cards.forEach(c=>{{const cb=c.querySelector('input'); const url=c.dataset.url; if(url in state) cb.checked=!!state[url]; c.classList.toggle('removed',!cb.checked); if(cb.checked) kept++;}}); document.getElementById('counter').textContent=`保留 ${{kept}} / ${{cards.length}} 条`; try{{localStorage.setItem(key,JSON.stringify(state))}}catch(e){{}}}}
-cards.forEach(c=>c.querySelector('input').addEventListener('change',e=>{{state[c.dataset.url]=e.target.checked; update();}}));
-document.getElementById('hideRemoved').onclick=()=>cards.forEach(c=>c.classList.toggle('hidden',!c.querySelector('input').checked));
-document.getElementById('showAll').onclick=()=>cards.forEach(c=>c.classList.remove('hidden'));
-document.getElementById('reset').onclick=()=>{{if(confirm('确认恢复全部为保留状态？')){{state={{}}; cards.forEach(c=>c.querySelector('input').checked=true); update();}}}};
-document.getElementById('exportCsv').onclick=()=>{{const rows=[['排名','视频链接','标题']]; cards.filter(c=>c.querySelector('input').checked).forEach(c=>rows.push([c.dataset.rank,c.dataset.url,c.querySelector('.title').textContent.trim()])); const csv=String.fromCharCode(65279)+rows.map(r=>r.map(v=>'"'+String(v).replaceAll('"','""')+'"').join(',')).join('\\r\\n'); const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([csv],{{type:'text/csv;charset=utf-8'}})); a.download='douyin_top100_kept.csv'; a.click(); URL.revokeObjectURL(a.href);}};
-update();
+const key='douyin-dance-top100:'+location.pathname;function cards(){{return [...document.querySelectorAll('.card')]}}function load(){{let saved={{}};try{{saved=JSON.parse(localStorage.getItem(key)||'{{}}')}}catch(e){{}}cards().forEach(c=>{{const box=c.querySelector('input');if(c.dataset.recordId in saved)box.checked=!!saved[c.dataset.recordId];box.addEventListener('change',()=>{{save();paint()}})}});paint()}}function save(){{const d={{}};cards().forEach(c=>d[c.dataset.recordId]=c.querySelector('input').checked);localStorage.setItem(key,JSON.stringify(d))}}function paint(){{let n=0;cards().forEach(c=>{{const k=c.querySelector('input').checked;c.classList.toggle('removed',!k);if(k)n++}});counter.textContent=`保留 ${{n}} / ${{cards().length}} 条`}}function showAll(){{cards().forEach(c=>c.style.display='')}}function hideRemoved(){{cards().forEach(c=>c.style.display=c.querySelector('input').checked?'':'none')}}function resetAll(){{cards().forEach(c=>c.querySelector('input').checked=true);save();showAll();paint()}}function exportCsv(){{const rows=[['rank','title','author','url']];cards().filter(c=>c.querySelector('input').checked).forEach(c=>{{const title=c.querySelector('.title');rows.push([c.querySelector('.rank').innerText.split(' ')[0],title.innerText,c.querySelector('.author').innerText,title.href])}});const csv='\ufeff'+rows.map(r=>r.map(v=>'"'+String(v).replaceAll('"','""')+'"').join(',')).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{{type:'text/csv'}}));a.download='selected_douyin_top.csv';a.click()}}load();
 </script></body></html>"""
-    path.write_text(doc, encoding="utf-8")
+    path.write_text(html_text, encoding="utf-8")
 
 
-def save_json(path: Path, obj: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+def write_json(path: Path, records: list[VideoRecord], tz: Any) -> None:
+    atomic_save_json(path, [record.to_dict(tz) for record in records])
 
 
-def build_outputs(
-    config: Mapping[str, Any],
-    window: DateWindow,
-    tz: ZoneInfo,
-    all_candidates: list[VideoRecord],
-    diagnostics: dict[str, Any],
-) -> Path:
-    eligible, by_platform = score_records(all_candidates, config, window, tz)
-    top_n = int(config.get("top_n_per_platform", 50))
-    platforms = enabled_platforms(config)
-    top_by_platform: dict[str, list[VideoRecord]] = {}
-    for platform in platforms:
-        top_by_platform[platform] = by_platform.get(platform, [])[:top_n]
-
-    output_root = APP_DIR / str(config.get("output_root", "output"))
-    output_dir = output_root / window.slug
-    output_dir.mkdir(parents=True, exist_ok=True)
-    basename = report_basename(config)
-
-    write_excel(
-        output_dir / f"{basename}.xlsx",
-        top_by_platform,
-        eligible,
-        all_candidates,
-        diagnostics,
-        window,
-        tz,
-        config,
-    )
-    write_html(output_dir / f"{basename}.html", top_by_platform, diagnostics, window, tz, config)
-    for platform in platforms:
-        write_csv(output_dir / f"{platform}_top{top_n}.csv", top_by_platform[platform], tz)
-    save_json(output_dir / "all_candidates.json", [r.to_dict(tz) for r in all_candidates])
-    save_json(output_dir / "ranked_eligible.json", [r.to_dict(tz) for r in eligible])
-    save_json(output_dir / "collection_diagnostics.json", diagnostics)
-
-    logging.info("报告已生成：%s", output_dir)
-    for platform in platforms:
-        logging.info("%s 正式榜：%d 条", PLATFORM_LABELS[platform], len(top_by_platform[platform]))
-    return output_dir
-
-
-def demo_records(window: DateWindow, platforms: Iterable[str]) -> list[VideoRecord]:
-    records: list[VideoRecord] = []
-    topics = ["扇风舞", "梦的翅膀受了伤", "电摆舞", "Apple Dance", "Dai Dai"]
-    for platform_index, platform in enumerate(platforms):
-        for i in range(1, 131):
-            topic = topics[i % len(topics)]
-            created = window.end - timedelta(hours=6 + (i * 2) % 150)
-            author_id = f"demo_{platform}_{i:02d}"
-            video_id = f"{platform_index + 7}{i:018d}"
-            records.append(
-                VideoRecord(
-                    platform=platform,
-                    video_id=video_id,
-                    url=build_platform_url(platform, video_id, author_id),
-                    title=f"#辣妹热舞 #小姐姐 #单人热舞 第{i}条演示数据",
-                    author_name=f"演示作者{i:02d}",
-                    author_id=author_id,
-                    create_time=created.astimezone(timezone.utc),
-                    views=50_000 + i * i * 3_700 + platform_index * 10_000,
-                    likes=3_000 + i * 731,
-                    comments=80 + i * 17,
-                    shares=40 + i * 9,
-                    favorites=70 + i * 13,
-                    followers=10_000 + i * 1_200,
-                    music=topic,
-                    hashtags=[topic, "舞蹈挑战"],
-                    source_keyword="单人美女热舞" if platform != "tiktok" else "solo sexy dance",
-                    data_sources={"demo"},
-                )
-            )
-    return records
-
-
-def run_collection(config: Mapping[str, Any], visible: bool = False, background: bool = False) -> Path:
-    window, tz = compute_window(config)
-    logging.info("统计窗口：%s", window.label)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    debug_dir = APP_DIR / "debug_screenshots" / window.slug
-    diagnostics: dict[str, Any] = {
-        "generated_at": datetime.now(tz).isoformat(),
-        "window": {"start": window.start.isoformat(), "end": window.end.isoformat(), "mode": window.mode},
-            }
-    all_candidates: list[VideoRecord] = []
-
-    with acquire_run_lock(window, config):
-        with sync_playwright() as playwright:
-            for platform in enabled_platforms(config):
-                platform_config = config.get("platforms", {}).get(platform, {})
-                if not platform_config.get("enabled", True):
-                    continue
-                collector = PlatformCollector(
-                    playwright,
-                    platform,
-                    config,
-                    platform_config,
-                    debug_dir,
-                    headless_override=False if visible else None,
-                    background_offscreen=bool(background and not visible),
-                )
-                try:
-                    records, diag = collector.collect()
-                    all_candidates.extend(records)
-                    diagnostics[platform] = diag
-                except CollectorNeedsAttention as exc:
-                    logging.error("[%s] 采集已主动停止：%s", PLATFORM_LABELS[platform], exc)
-                    diagnostics[platform] = {
-                        "platform": platform,
-                        "error": str(exc),
-                        "candidate_count": len(collector.store),
-                        "verification_count": collector.captcha_count,
-                        "needs_attention": True,
-                    }
-                    save_json(debug_dir / "collection_stopped.json", diagnostics)
-                    raise
-                except Exception as exc:
-                    logging.error("[%s] 平台采集失败：%s", PLATFORM_LABELS[platform], exc)
-                    logging.debug(traceback.format_exc())
-                    diagnostics[platform] = {"platform": platform, "error": str(exc), "candidate_count": 0}
-
-    return build_outputs(config, window, tz, all_candidates, diagnostics)
-
-
-def command_progress(config: Mapping[str, Any]) -> None:
-    window, tz = compute_window(config)
-    found = False
+def generate_outputs(config: Mapping[str, Any], window: DateWindow, platform_records: Mapping[str, list[VideoRecord]], diagnostics: Mapping[str, Any], tz: Any, open_report: bool = False) -> Path:
+    output_root = APP_DIR / str(config.get("output_root", "output")) / window.slug
+    output_root.mkdir(parents=True, exist_ok=True)
+    base = report_basename(config)
     for platform in enabled_platforms(config):
-        manager = CollectionCheckpoint(platform, window, tz, config, config.get("platforms", {}).get(platform, {}))
-        state = manager.load()
-        if not state:
-            print(f"{PLATFORM_LABELS[platform]}：当前统计周没有可恢复断点。")
-            continue
-        found = True
-        print(
-            f"{PLATFORM_LABELS[platform]}：阶段={state.get('phase')}，"
-            f"搜索={state.get('next_keyword_index', 0)}/{len(config.get('platforms', {}).get(platform, {}).get('keywords', []))}，"
-            f"详情已处理={state.get('processed_detail_count', 0)}/{len(state.get('detail_keys', []))}，"
-            f"成功={len(state.get('completed_detail_keys', []))}，记录={state.get('record_count', 0)}\n"
-            f"断点文件：{manager.path}"
-        )
-    if not found:
-        print("没有发现当前统计周的断点。")
-
-
-def command_reset_progress(config: Mapping[str, Any], yes: bool) -> None:
-    if not yes:
-        raise ValueError("重置会删除当前统计周的断点。请使用 reset-progress --yes 明确确认。")
-    window, tz = compute_window(config)
-    lock_path = DATA_DIR / "locks" / f"weekly_{window.slug}.lock"
-    if lock_path.exists():
+        write_csv(output_root / f"{platform}_top{len(platform_records.get(platform, []))}.csv", platform_records.get(platform, []), tz)
+    all_records = [record for platform in enabled_platforms(config) for record in platform_records.get(platform, [])]
+    write_json(output_root / "all_candidates.json", all_records, tz)
+    write_json(output_root / "diagnostics.json", [], tz)
+    atomic_save_json(output_root / "diagnostics.json", diagnostics)
+    write_excel(output_root / f"{base}.xlsx", platform_records, tz, diagnostics)
+    html_path = output_root / f"{base}.html"
+    write_html(html_path, platform_records, window, config, tz)
+    if open_report:
         try:
-            lock = json.loads(lock_path.read_text(encoding="utf-8"))
+            os.startfile(str(html_path))
         except Exception:
-            lock = {}
-        pid = int(lock.get("pid", 0) or 0)
-        if _process_is_alive(pid):
-            raise CollectorNeedsAttention(f"采集任务 PID {pid} 仍在运行，不能重置断点。请先正常关闭它。")
-        lock_path.unlink(missing_ok=True)
-    for platform in enabled_platforms(config):
-        manager = CollectionCheckpoint(platform, window, tz, config, config.get("platforms", {}).get(platform, {}))
-        manager.delete()
-        print(f"已删除 {PLATFORM_LABELS[platform]} 当前统计周断点：{manager.path}")
+            pass
+    logging.info("报告已生成：%s", output_root)
+    return output_root
 
 
-def command_login(config: Mapping[str, Any], platform: str) -> None:
-    platforms = enabled_platforms(config) if platform == "all" else (platform,)
+def run_collection(config: Mapping[str, Any], visible: bool, background: bool = False) -> Path:
+    ensure_directories(config)
+    tz = get_timezone(config)
+    window = calculate_window(config, tz)
+    logging.info("统计窗口：%s", window.label)
+    platform_records: dict[str, list[VideoRecord]] = {}
+    diagnostics: dict[str, Any] = {}
+    top_n = int(config.get("top_n_per_platform", 100))
+    enabled = enabled_platforms(config)
+    logging.info("启动采集，关键词 %d 个，模式：%s", sum(len(config.get("platforms", {}).get(p, {}).get("keywords", [])) for p in enabled), "前台" if visible else ("后台兼容（屏幕外正常浏览器）" if background else "无头"))
+    stale_hours = float(config.get("browser", {}).get("lock_stale_hours", 12))
+    with RunLock("douyin_profile", stale_hours):
+        for platform in enabled:
+            platform_config = config.get("platforms", {}).get(platform, {})
+            collector = BaseCollector(platform, config, platform_config, tz, window, visible=visible, background=background)
+            records, diag = collector.collect()
+            records = [record for record in records if within_window(record, window, tz) and not record.exclusion_reason]
+            ranked = score_records(records, config, tz)[:top_n]
+            platform_records[platform] = ranked
+            diagnostics[platform] = diag
+            logging.info("%s 入榜：%d 条", PLATFORM_LABELS[platform], len(ranked))
+    return generate_outputs(config, window, platform_records, diagnostics, tz, open_report=False)
+
+
+def command_login(config: Mapping[str, Any]) -> None:
+    ensure_directories(config)
     with sync_playwright() as playwright:
-        for item in platforms:
-            login_platform(playwright, item, config)
-    print("登录会话已保存到当前项目的 data\\profiles 目录。")
+        for platform in enabled_platforms(config):
+            platform_config = config.get("platforms", {}).get(platform, {})
+            collector = BaseCollector(platform, config, platform_config, get_timezone(config), calculate_window(config, get_timezone(config)), visible=True)
+            context = collector.launch_context(playwright)
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(PLATFORM_HOME[platform], wait_until="domcontentloaded")
+            print(f"\n请在浏览器中登录 {PLATFORM_LABELS[platform]}。登录完成并确认首页可用后，回到这里按回车。")
+            input()
+            context.close()
 
 
 def command_demo(config: Mapping[str, Any]) -> Path:
-    window, tz = compute_window(config)
-    platforms = enabled_platforms(config)
-    records = demo_records(window, platforms)
-    diagnostics = {
-        "generated_at": datetime.now(tz).isoformat(),
-        "demo": True,
-        "window": {"start": window.start.isoformat(), "end": window.end.isoformat(), "mode": window.mode},
-    }
-    for platform in platforms:
-        diagnostics[platform] = {"candidate_count": sum(1 for r in records if r.platform == platform), "demo": True}
-    output = build_outputs(config, window, tz, records, diagnostics)
-    print(f"演示报告已生成：{output}")
-    return output
+    ensure_directories(config)
+    tz = get_timezone(config)
+    window = calculate_window(config, tz)
+    platform_records: dict[str, list[VideoRecord]] = {}
+    now = datetime.now(timezone.utc)
+    for platform in enabled_platforms(config):
+        records: list[VideoRecord] = []
+        for index in range(140):
+            records.append(VideoRecord(
+                platform=platform,
+                video_id=f"demo{index+1}",
+                url=f"https://example.com/{platform}/video/{index+1}",
+                title=f"单人美女热舞演示 #{index+1} #辣妹舞蹈 #扭胯",
+                author_name=f"demo_creator_{index+1}",
+                create_time=now - timedelta(days=index % 7, hours=index % 20),
+                likes=1000 + (140 - index) * 732,
+                comments=50 + (index * 17) % 1800,
+                shares=35 + (index * 23) % 900,
+                favorites=70 + (index * 31) % 1600,
+                followers=50_000 + index * 1000,
+                source_keyword="单人美女热舞",
+                data_sources={"demo"},
+            ))
+        platform_records[platform] = score_records(records, config, tz)[: int(config.get("top_n_per_platform", 100))]
+    return generate_outputs(config, window, platform_records, {p: {"mode": "demo"} for p in platform_records}, tz, open_report=False)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="抖音每周单人女性热舞候选 Top100")
-    sub = parser.add_subparsers(dest="command", required=True)
-    run_parser = sub.add_parser("run", help="执行真实采集并生成报告")
-    mode_group = run_parser.add_mutually_exclusive_group()
-    mode_group.add_argument("--visible", action="store_true", help="显示浏览器，用于人工完成验证或排查空数据")
-    mode_group.add_argument("--background", action="store_true", help="使用屏幕外正常浏览器后台运行，兼容抖音搜索")
-    sub.add_parser("progress", help="查看当前统计周的断点进度")
-    reset_parser = sub.add_parser("reset-progress", help="删除当前统计周断点并从头采集")
-    reset_parser.add_argument("--yes", action="store_true", help="确认删除当前统计周断点")
-    login = sub.add_parser("login", help="首次或登录失效时保存登录会话")
-    login.add_argument("--platform", choices=["douyin", "kuaishou", "tiktok", "all"], default="all")
-    sub.add_parser("demo", help="不访问平台，生成一份演示报告以验证安装")
-    return parser.parse_args()
+def show_progress(config: Mapping[str, Any]) -> None:
+    ensure_directories(config)
+    tz = get_timezone(config)
+    window = calculate_window(config, tz)
+    print(f"统计窗口：{window.label}")
+    for platform in enabled_platforms(config):
+        path = DATA_DIR / "checkpoints" / f"{platform}_{window.slug}.json"
+        print(f"\n[{PLATFORM_LABELS[platform]}]")
+        if not path.exists():
+            print("尚无断点。")
+            continue
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"断点不可读取：{exc}")
+            continue
+        print(f"阶段：{state.get('phase')}")
+        print(f"搜索进度：{state.get('next_keyword_index', 0)}/{len(config.get('platforms', {}).get(platform, {}).get('keywords', []))}")
+        print(f"候选记录：{state.get('record_count', 0)}")
+        print(f"详情进度：{len(state.get('completed_detail_keys', []))}/{len(state.get('detail_keys', []))}")
+        print(f"最后保存：{state.get('updated_at', '')}")
+        print(f"备注：{state.get('note', '')}")
+
+
+def reset_progress(config: Mapping[str, Any]) -> None:
+    ensure_directories(config)
+    tz = get_timezone(config)
+    window = calculate_window(config, tz)
+    removed = 0
+    for platform in enabled_platforms(config):
+        path = DATA_DIR / "checkpoints" / f"{platform}_{window.slug}.json"
+        if path.exists():
+            path.unlink()
+            removed += 1
+            print(f"已删除：{path}")
+    print(f"完成，共删除 {removed} 个当前统计周期断点。登录状态未删除。")
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="抖音单人女性热舞候选 Top100")
+    parser.add_argument("command", nargs="?", default="run", choices=["run", "login", "demo", "progress", "reset-progress"])
+    parser.add_argument("--visible", action="store_true", help="显示浏览器窗口")
+    parser.add_argument("--background", action="store_true", help="后台兼容模式：正常浏览器移到屏幕外")
+    parser.add_argument("--config", default=str(CONFIG_PATH))
+    args = parser.parse_args()
     setup_logging()
     try:
-        config = load_config()
-        args = parse_args()
+        config = load_config(Path(args.config))
         if args.command == "login":
-            command_login(config, args.platform)
+            command_login(config)
         elif args.command == "demo":
-            command_demo(config)
+            output = command_demo(config)
+            print(f"演示报告：{output}")
         elif args.command == "progress":
-            command_progress(config)
+            show_progress(config)
         elif args.command == "reset-progress":
-            command_reset_progress(config, bool(args.yes))
-        elif args.command == "run":
-            output = run_collection(config, visible=bool(args.visible), background=bool(args.background))
+            reset_progress(config)
+        else:
+            output = run_collection(config, visible=args.visible, background=args.background)
             print(f"\n完成：{output}")
         return 0
     except KeyboardInterrupt:
-        logging.warning("用户中止运行。")
+        logging.warning("用户中断，断点已经尽可能保存。")
         return 130
+    except CollectorNeedsAttention as exc:
+        logging.error("采集已主动停止：%s", exc)
+        print(f"\n需要处理：{exc}")
+        return 2
     except Exception as exc:
         logging.error("运行失败：%s", exc)
         logging.error(traceback.format_exc())
