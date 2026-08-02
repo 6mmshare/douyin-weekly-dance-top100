@@ -1,0 +1,47 @@
+name: Apply CAPTCHA detection fixes
+
+on:
+  push:
+    paths:
+      - "bootstrap/captcha-ready.txt"
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct and apply update
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat bootstrap/captcha-chunk-*.txt > /tmp/captcha-update.b64
+          base64 --decode /tmp/captcha-update.b64 > /tmp/captcha-update.zip
+          printf '%s  %s\n' '700d98f33e4f71b76b824137e31abf2864d7e26f5b7c5a21918bfc0a084164eb' '/tmp/captcha-update.zip' | sha256sum --check
+          unzip -oq /tmp/captcha-update.zip -d .
+          python -m py_compile weekly_dance_ranker.py
+          python - <<'PY'
+          import yaml
+          with open('config.yaml', 'r', encoding='utf-8') as f:
+              yaml.safe_load(f)
+          PY
+          rm -rf bootstrap __pycache__
+          rm -f .github/workflows/apply-captcha-fix.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+
+      - name: Commit final files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix CAPTCHA detection and keyword pacing"
+          git push
