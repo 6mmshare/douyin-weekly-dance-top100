@@ -22,9 +22,9 @@ jobs:
         run: |
           set -euo pipefail
           cat bootstrap/creator-recent7d-20260803/chunk-*.txt > /tmp/creator-recent7d.b64
-          base64 --decode /tmp/creator-recent7d.b64 > /tmp/creator-recent7d.zip
-          printf '%s  %s\n' 'bc22af9be6268c16ec38f3c85e396366b5b9be4e270c2dd75581be724fb609d0' '/tmp/creator-recent7d.zip' | sha256sum --check
-          unzip -oq /tmp/creator-recent7d.zip -d .
+          base64 --decode /tmp/creator-recent7d.b64 > /tmp/creator-recent7d.tar.xz
+          printf '%s  %s\n' '70cd471fb9c3e3007344cf66563c2175a499eba63a19e5a73208a21d6ed3a881' '/tmp/creator-recent7d.tar.xz' | sha256sum --check
+          tar -xJf /tmp/creator-recent7d.tar.xz -C .
 
       - name: Validate public package
         shell: bash
