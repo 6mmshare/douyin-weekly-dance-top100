@@ -1,0 +1,11 @@
+# Local creator list and account assets
+creators_watchlist.xlsx
+
+# Shared/private browser profile and runtime data
+.venv/
+data/
+logs/
+output/
+debug_screenshots/
+__pycache__/
+*.pyc
