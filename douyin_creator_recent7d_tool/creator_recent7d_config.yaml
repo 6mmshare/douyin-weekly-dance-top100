@@ -1,0 +1,29 @@
+timezone: Asia/Shanghai
+# rolling_last_7_days=运行时刻向前7×24小时；previous_7_complete_days=运行日前7个完整自然日
+window_mode: rolling_last_7_days
+output_root: output/creator_recent7d
+collector:
+  navigation_timeout_ms: 60000
+  max_profile_scrolls: 35
+  profile_no_new_scrolls: 5
+  old_batch_stop_count: 2
+  profile_scroll_pause_min_seconds: 1.3
+  profile_scroll_pause_max_seconds: 2.4
+  creator_delay_min_seconds: 5
+  creator_delay_max_seconds: 10
+  verification_wait_timeout_seconds: 900
+  verification_poll_seconds: 1.5
+  verification_stable_clear_seconds: 5
+  # 连续多次检测到真实可见强信号才暂停，避免骨架屏和隐藏组件误报。
+  verification_required_consecutive_hits: 2
+  verification_confirm_interval_seconds: 0.9
+  # 验证消失并稳定后额外等待，防止页面尚未恢复就切换博主。
+  verification_post_clear_wait_seconds: 4
+  lock_stale_hours: 12
+ranking:
+  top_n: 100
+  likes: 0.35
+  comments: 0.10
+  shares: 0.20
+  favorites: 0.15
+  likes_velocity: 0.20
