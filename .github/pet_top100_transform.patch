@@ -1,0 +1,154 @@
+--- douyin_pet_dance_top100/pet_weekly_ranker.py
++++ douyin_pet_dance_top100/pet_weekly_ranker.py
+@@ -1,8 +1,8 @@
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+-"""抖音每周单人女性热舞候选 Top100（断点续跑与风控保护版）。
++"""抖音每周宠物跳舞与宠物武打候选 Top100（断点续跑与风控保护版）。
+ 
+ 设计原则：
+ - 使用 Playwright 正常浏览器会话，不绕过验证码或平台签名。
+ - 监听页面公开返回的 JSON/XHR，并以 DOM 链接作为兜底。
+ - 对缺失字段如实标记；不伪造发布时间或互动数据。
+@@ -44,11 +44,11 @@
+ from playwright.sync_api import BrowserContext, Page, Playwright, Response, TimeoutError as PlaywrightTimeoutError, sync_playwright
+ 
+ APP_DIR = Path(__file__).resolve().parent
+ CONFIG_PATH = APP_DIR / "config.yaml"
+ DATA_DIR = APP_DIR / "data"
+-PROFILE_DIR = DATA_DIR / "profiles"
++PROFILE_DIR = APP_DIR.parent / "data" / "profiles"
+ LOG_DIR = APP_DIR / "logs"
+ LOG_PATH = LOG_DIR / "weekly_ranker.log"
+ 
+ PLATFORM_LABELS = {"douyin": "抖音", "kuaishou": "快手", "tiktok": "TikTok"}
+ PLATFORM_HOME = {
+@@ -83,13 +83,18 @@
+ def report_basename(config: Mapping[str, Any]) -> str:
+     total = int(config.get("top_n_per_platform", 50)) * len(enabled_platforms(config))
+     return f"weekly_dance_top{total}"
+ 
+ DANCE_TERMS = {
+-    "舞蹈", "跳舞", "热舞", "独舞", "单人舞", "女团舞", "翻跳",
+-    "扭腰", "扭胯", "摆胯", "高跟鞋舞", "椅子舞", "慢摇", "对镜热舞", "dance",
+-    "dancing", "solo dance", "sexy dance", "heels dance", "dance cover", "choreography",
++    "宠物跳舞", "猫咪跳舞", "小猫跳舞", "狗狗跳舞", "小狗跳舞", "萌宠跳舞",
++    "跳舞猫", "跳舞狗", "舞蹈猫", "舞蹈狗", "会跳舞的狗", "会跳舞的猫",
++    "宠物蹦迪", "猫咪蹦迪", "狗狗蹦迪", "卡点萌宠", "萌宠卡点", "宠物卡点",
++    "宠物武打", "猫咪武打", "狗狗武打", "功夫猫", "功夫猫咪", "功夫狗",
++    "猫咪功夫", "狗狗功夫", "猫猫打拳", "狗狗打拳", "宠物打拳", "萌宠打拳",
++    "猫咪对打", "狗狗对打", "猫狗大战", "猫咪拳击", "狗狗拳击", "宠物拳击",
++    "动物成精", "萌宠成精", "万物皆可舞", "pet dance", "dancing cat", "dancing dog",
++    "cat dance", "dog dance", "pet kung fu", "kung fu cat", "kung fu dog"
+ }
+@@ -2071,75 +2076,70 @@
+ def evaluate_target_match(record: VideoRecord, filters: Mapping[str, Any]) -> tuple[float, str, bool, bool, bool, str]:
+-    """Conservative text relevance filter.
+-
+-    Search terms are only a small recall hint. The old implementation gave up to 74
+-    points merely because a random recommendation was captured under a good keyword;
+-    that is why landscapes, films and tutorials ranked highly.
++    """宠物跳舞/武打的保守文字相关性过滤。
++
++    搜索词只用于召回，视频标题、话题、作者和音乐中的宠物+动作信号才是主要证据。
+     """
+     content = content_text_blob(record)
+     source = normalize_text(record.source_keyword).casefold()
+ 
+-    minor_terms = filters.get("minor_terms", [])
+-    male_terms = filters.get("male_terms", list(MALE_EXCLUDE_TERMS))
+-    group_terms = filters.get("group_terms", list(GROUP_EXCLUDE_TERMS))
+-    format_terms = filters.get("format_exclude_terms", list(FORMAT_EXCLUDE_TERMS))
+-    non_human_terms = filters.get("non_human_terms", list(NON_HUMAN_EXCLUDE_TERMS))
+-    female_terms = filters.get("female_text_terms", list(FEMALE_TARGET_TERMS))
+-    solo_terms = filters.get("solo_terms", list(SOLO_TARGET_TERMS))
+-    sexy_terms = filters.get("sexy_style_terms", list(SEXY_STYLE_TERMS))
++    exclude_terms = filters.get("exclude_terms", [])
++    ai_terms = filters.get("ai_terms", [])
++    human_terms = filters.get("human_only_terms", [])
++    pet_terms = filters.get("pet_terms", [])
++    dance_terms = filters.get("pet_dance_terms", [])
++    fight_terms = filters.get("pet_fight_terms", [])
++    positive_terms = [*dance_terms, *fight_terms]
+ 
+     for label, terms in (
+-        ("疑似未成年人文字信号", minor_terms),
+-        ("男性舞者文字信号", male_terms),
+-        ("多人/双人/群舞文字信号", group_terms),
+-        ("教程/合集/搬运文字信号", format_terms),
+-        ("AI/动漫/虚拟角色文字信号", non_human_terms),
++        ("教程/合集/搬运/商品内容", exclude_terms),
++        ("AI生成或动画内容", ai_terms),
++        ("纯人类舞蹈内容", human_terms),
+     ):
+         hit = first_matching_term(content, terms)
+         if hit:
+             return 0.0, "排除", False, False, False, f"{label}：{hit}"
+ 
+-    female_signal = contains_any(content, female_terms)
+-    solo_signal = contains_any(content, solo_terms)
+-    sexy_signal = contains_any(content, sexy_terms)
+-    dance_hits = sum(1 for term in DANCE_TERMS if term.casefold() in content)
+-    sexy_hits = len(matching_terms(content, sexy_terms))
+-    female_hits = len(matching_terms(content, female_terms))
+-    solo_hits = len(matching_terms(content, solo_terms))
++    pet_hits = len(matching_terms(content, pet_terms))
++    dance_hits = len(matching_terms(content, dance_terms))
++    fight_hits = len(matching_terms(content, fight_terms))
++    source_pet = contains_any(source, pet_terms)
++    source_action = contains_any(source, positive_terms)
++
++    if pet_hits == 0 and not source_pet:
++        return 0.0, "排除", False, False, False, "缺少宠物主体信号"
+ 
+     score = 0.0
+-    score += min(32.0, sexy_hits * 10.0)
+-    score += min(20.0, female_hits * 10.0)
+-    score += min(18.0, solo_hits * 9.0)
+-    score += min(24.0, dance_hits * 8.0)
++    score += min(42.0, pet_hits * 14.0)
++    score += min(44.0, dance_hits * 14.0 + fight_hits * 14.0)
++    if dance_hits and fight_hits:
++        score += 8.0
+     if contains_any(content, [
+-        "辣妹热舞", "小姐姐热舞", "单人热舞", "御姐热舞", "扭胯舞",
+-        "摇胯舞", "高跟鞋舞", "椅子舞", "纯御舞", "性感纯欲舞"
++        "宠物跳舞", "猫咪跳舞", "狗狗跳舞", "萌宠跳舞", "会跳舞的狗子",
++        "功夫猫", "功夫猫咪", "猫咪功夫", "狗狗功夫", "宠物武打",
++        "猫猫打拳", "狗狗打拳", "宠物拳击", "动物成精", "萌宠成精"
+     ]):
+-        score += 12.0
++        score += 18.0
+ 
+-    if any(term.casefold() in source for term in DANCE_TERMS):
++    if source_pet:
+         score += 4.0
+-    if contains_any(source, sexy_terms):
++    if source_action:
+         score += 4.0
+-    if contains_any(source, female_terms):
+-        score += 2.0
+ 
+     score = min(100.0, score)
+-    if score >= 62:
++    if score >= 68:
+         level = "A-强匹配"
+-    elif score >= 34:
++    elif score >= 38:
+         level = "B-较匹配"
+     else:
+         level = "C-宽松候选"
+-    return score, level, female_signal, solo_signal, sexy_signal, ""
++    return score, level, bool(pet_hits), bool(dance_hits), bool(fight_hits), ""
+@@ -2552,11 +2552,11 @@
+-    title = f"{' / '.join(PLATFORM_LABELS[p] for p in platforms)} 单人女性热舞候选 Top{total}"
++    title = f"{' / '.join(PLATFORM_LABELS[p] for p in platforms)} 宠物跳舞/武打候选 Top{total}"
+@@ -2658,11 +2658,11 @@
+-                    title=f"#辣妹热舞 #小姐姐 #单人热舞 第{i}条演示数据",
++                    title=f"#萌宠跳舞 #功夫猫 第{i}条演示数据",
+@@ -2670,11 +2670,11 @@
+-                    source_keyword="单人美女热舞" if platform != "tiktok" else "solo sexy dance",
++                    source_keyword="宠物跳舞" if platform != "tiktok" else "pet dance",
+@@ -2793,11 +2793,11 @@
+-    parser = argparse.ArgumentParser(description="抖音每周单人女性热舞候选 Top100")
++    parser = argparse.ArgumentParser(description="抖音每周宠物跳舞/武打候选 Top100")
