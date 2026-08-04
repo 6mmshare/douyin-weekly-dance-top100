@@ -1,0 +1,269 @@
+timezone: Asia/Shanghai
+window_mode: previous_7_complete_days
+top_n_per_platform: 100
+output_root: output
+browser:
+  headless: true
+  background_window_x: -32000
+  background_window_y: -32000
+  slow_mo_ms: 0
+  navigation_timeout_ms: 60000
+  scrolls_per_keyword: 14
+  scroll_pause_seconds: 1.35
+  request_delay_seconds: 0.7
+  keyword_delay_min_seconds: 12
+  keyword_delay_max_seconds: 20
+  verification_poll_seconds: 1.5
+  verification_confirm_checks: 2
+  verification_confirm_interval_seconds: 0.8
+  verification_min_evidence_score: 4
+  verification_wait_timeout_seconds: 600
+  verification_stable_clear_seconds: 5
+  verification_post_clear_delay_seconds: 4
+  max_candidates_per_platform: 3000
+  max_detail_visits_per_platform: 360
+  detail_wait_seconds: 1.8
+  checkpoint_batch_size: 20
+  detail_delay_min_seconds: 2.2
+  detail_delay_max_seconds: 4.8
+  batch_rest_min_seconds: 18
+  batch_rest_max_seconds: 40
+  max_detail_attempts: 2
+  failure_backoff_base_seconds: 3
+  failure_backoff_max_seconds: 45
+  consecutive_failure_cooldown_after: 4
+  consecutive_failure_abort_after: 8
+  cooldown_min_seconds: 45
+  cooldown_max_seconds: 90
+  lock_stale_hours: 12
+  save_debug_screenshots: true
+  headless_abort_after_empty_keywords: 4
+  headless_min_candidates_before_empty_abort: 8
+  repeated_result_jaccard_threshold: 0.88
+  minimum_keyword_result_count: 5
+filters:
+  minimum_target_match: 18
+  minimum_dance_relevance: 10
+  require_known_publish_time: true
+  pet_terms:
+  - 宠物
+  - 萌宠
+  - 猫咪
+  - 小猫
+  - 猫猫
+  - 喵星人
+  - 布偶猫
+  - 橘猫
+  - 狸花猫
+  - 英短
+  - 狗狗
+  - 小狗
+  - 狗子
+  - 汪星人
+  - 柴犬
+  - 柯基
+  - 比熊
+  - 萨摩耶
+  - 金毛
+  - 哈士奇
+  - 边牧
+  - 法斗
+  - 阿拉斯加
+  - 鹦鹉
+  - 兔子
+  - 仓鼠
+  - pet
+  - cat
+  - kitten
+  - dog
+  - puppy
+  pet_dance_terms:
+  - 宠物跳舞
+  - 萌宠跳舞
+  - 猫咪跳舞
+  - 小猫跳舞
+  - 猫猫跳舞
+  - 狗狗跳舞
+  - 小狗跳舞
+  - 狗子跳舞
+  - 跳舞猫
+  - 跳舞狗
+  - 舞蹈猫
+  - 舞蹈狗
+  - 会跳舞的狗
+  - 会跳舞的猫
+  - 宠物蹦迪
+  - 猫咪蹦迪
+  - 狗狗蹦迪
+  - 萌宠蹦迪
+  - 宠物卡点
+  - 萌宠卡点
+  - 卡点萌宠
+  - 猫咪卡点
+  - 狗狗卡点
+  - 科目三
+  - 捂嘴舞
+  - 捂鼻子舞
+  - 摇摆舞
+  - 扭胯
+  - 卡点
+  - dance
+  - dancing cat
+  - dancing dog
+  - cat dance
+  - dog dance
+  - pet dance
+  pet_fight_terms:
+  - 宠物武打
+  - 萌宠武打
+  - 猫咪武打
+  - 狗狗武打
+  - 功夫猫
+  - 功夫猫咪
+  - 功夫狗
+  - 猫咪功夫
+  - 狗狗功夫
+  - 猫猫打拳
+  - 猫咪打拳
+  - 狗狗打拳
+  - 宠物打拳
+  - 萌宠打拳
+  - 猫咪拳击
+  - 狗狗拳击
+  - 宠物拳击
+  - 猫咪对打
+  - 狗狗对打
+  - 猫狗大战
+  - 猫咪格斗
+  - 狗狗格斗
+  - 萌宠格斗
+  - 武术猫
+  - 武术狗
+  - kung fu cat
+  - kung fu dog
+  - pet kung fu
+  exclude_terms:
+  - 教程
+  - 教学
+  - 怎么做
+  - 制作教程
+  - 剪辑教程
+  - 特效教程
+  - 舞蹈教程
+  - 合集
+  - 盘点
+  - 混剪
+  - 影视剪辑
+  - 电影片段
+  - 综艺片段
+  - 直播录屏
+  - 搬运
+  - 商品
+  - 带货
+  - 宠物用品
+  - 猫粮
+  - 狗粮
+  - 领养
+  - 出售
+  - 价格
+  - 训练课程
+  - 宠物店
+  ai_terms:
+  - AI生成
+  - AI宠物
+  - AI猫咪
+  - AI狗狗
+  - 动画
+  - 动漫
+  - 卡通
+  - 虚拟宠物
+  - 数字宠物
+  - 特效生成
+  - seedance
+  - 可灵AI
+  - 即梦AI
+  - 海螺AI
+  - 万物皆可唤醒
+  human_only_terms:
+  - 小姐姐跳舞
+  - 美女跳舞
+  - 辣妹跳舞
+  - 女生跳舞
+  - 男生跳舞
+  - 女团
+  - 男团
+  - 少儿舞蹈
+  - 儿童舞蹈
+  - 广场舞
+  - 舞蹈老师
+scoring:
+  likes: 0.25
+  shares: 0.2
+  favorites: 0.15
+  comments: 0.1
+  likes_velocity: 0.2
+  target_match: 0.1
+platforms:
+  douyin:
+    enabled: true
+    locale: zh-CN
+    keywords:
+    - 宠物跳舞
+    - 萌宠跳舞
+    - 猫咪跳舞
+    - 小猫跳舞
+    - 猫猫跳舞
+    - 狗狗跳舞
+    - 小狗跳舞
+    - 狗子跳舞
+    - 跳舞猫
+    - 跳舞狗
+    - 会跳舞的狗子
+    - 会跳舞的猫咪
+    - 宠物蹦迪
+    - 萌宠蹦迪
+    - 猫咪蹦迪
+    - 狗狗蹦迪
+    - 宠物卡点
+    - 萌宠卡点
+    - 卡点萌宠
+    - 猫咪卡点
+    - 狗狗卡点
+    - 宠物科目三
+    - 猫咪科目三
+    - 狗狗科目三
+    - 猫咪捂嘴舞
+    - 猫咪捂鼻子舞
+    - 宠物摇摆舞
+    - 动物成精 跳舞
+    - 萌宠成精 跳舞
+    - 宠物武打
+    - 萌宠武打
+    - 猫咪武打
+    - 狗狗武打
+    - 功夫猫
+    - 功夫猫咪
+    - 猫咪功夫
+    - 狗狗功夫
+    - 猫猫打拳
+    - 猫咪打拳
+    - 狗狗打拳
+    - 宠物打拳
+    - 萌宠打拳
+    - 猫咪拳击
+    - 狗狗拳击
+    - 宠物拳击
+    - 猫咪对打
+    - 狗狗对打
+    - 猫狗大战
+    - 猫咪格斗
+    - 狗狗格斗
+    - 萌宠格斗
+  kuaishou:
+    enabled: false
+    locale: zh-CN
+    keywords: []
+  tiktok:
+    enabled: false
+    locale: en-US
+    keywords: []
