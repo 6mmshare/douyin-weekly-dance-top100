@@ -1,0 +1,38 @@
+name: Build pet Top100 source
+
+on:
+  push:
+    paths:
+      - '.github/pet_top100_transform.patch'
+      - '.github/workflows/build-pet-top100.yml'
+      - 'weekly_dance_ranker.py'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build pet source from maintained Top100 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp weekly_dance_ranker.py douyin_pet_dance_top100/pet_weekly_ranker.py
+          patch --batch --forward --fuzz=3 -p0 < .github/pet_top100_transform.patch
+          python -m py_compile douyin_pet_dance_top100/pet_weekly_ranker.py
+      - name: Commit generated source
+        shell: bash
+        run: |
+          if git diff --quiet -- douyin_pet_dance_top100/pet_weekly_ranker.py; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add douyin_pet_dance_top100/pet_weekly_ranker.py
+          git commit -m 'Generate pet dance Top100 source'
+          git push
