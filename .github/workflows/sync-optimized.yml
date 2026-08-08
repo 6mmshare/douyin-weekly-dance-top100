@@ -1,0 +1,34 @@
+name: Sync optimized source
+
+on:
+  push:
+    paths:
+      - '.sync_payload/READY_V2'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Rebuild optimized source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .sync_payload/v2_part*.txt | base64 -d > /tmp/source.zip
+          echo "a2242dbf63fedfa3f4c29bef5444cee4c0ac4cb4f173438c3840952343b51e87  /tmp/source.zip" | sha256sum -c -
+          rm -rf /tmp/source_tree
+          mkdir -p /tmp/source_tree
+          unzip -q /tmp/source.zip -d /tmp/source_tree
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' ! -name '.sync_payload' -exec rm -rf {} +
+          cp -a /tmp/source_tree/. ./
+          rm -rf .sync_payload
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'chore: sync optimized tested source tree'
+          git push
